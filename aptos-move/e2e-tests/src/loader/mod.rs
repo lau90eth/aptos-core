@@ -276,7 +276,7 @@ impl DependencyGraph {
             &node.name,
             &deps,
             node.self_value,
-        );
+        )?;
 
         let package = BuiltPackage::build(package_path, BuildOptions::default()).unwrap();
 
@@ -347,7 +347,7 @@ impl DependencyGraph {
             assert_eq!(
                 output.status(),
                 &TransactionStatus::Keep(ExecutionStatus::Success)
-            );
+            )?;
             executor.apply_write_set(output.write_set());
         }
         self.caculate_dependency_sizes();
@@ -358,14 +358,14 @@ impl DependencyGraph {
                     transaction_index: txn_index as u32,
                 },
                 None,
-            );
+            )?;
             let (output, log) = executor
                 .execute_transaction_with_gas_profiler(txn, &auxiliary_info)
                 .unwrap();
             assert_eq!(
                 output.status(),
                 &TransactionStatus::Keep(ExecutionStatus::Success)
-            );
+            )?;
             let node = self.graph.node_weight(*account_idx).unwrap();
             assert!(
                 GasQuantity::new(node.self_size + node.transitive_dep_size)
@@ -374,7 +374,7 @@ impl DependencyGraph {
                         .dependencies
                         .iter()
                         .fold(GasQuantity::new(0), |total_size, dep| total_size + dep.size)
-            );
+            )?;
             executor.apply_write_set(output.write_set());
         }
     }
