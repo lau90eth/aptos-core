@@ -39,6 +39,8 @@
 -  [Function `multisig_payload_internal`](#0x1_transaction_context_multisig_payload_internal)
 -  [Function `multisig_address`](#0x1_transaction_context_multisig_address)
 -  [Function `inner_entry_function_payload`](#0x1_transaction_context_inner_entry_function_payload)
+-  [Function `is_encrypted_txn`](#0x1_transaction_context_is_encrypted_txn)
+-  [Function `is_encrypted_txn_internal`](#0x1_transaction_context_is_encrypted_txn_internal)
 -  [Function `monotonically_increasing_counter`](#0x1_transaction_context_monotonically_increasing_counter)
 -  [Function `monotonically_increasing_counter_internal`](#0x1_transaction_context_monotonically_increasing_counter_internal)
 -  [Function `monotonically_increasing_counter_internal_for_test_only`](#0x1_transaction_context_monotonically_increasing_counter_internal_for_test_only)
@@ -59,6 +61,7 @@
     -  [Function `chain_id_internal`](#@Specification_1_chain_id_internal)
     -  [Function `entry_function_payload_internal`](#@Specification_1_entry_function_payload_internal)
     -  [Function `multisig_payload_internal`](#@Specification_1_multisig_payload_internal)
+    -  [Function `is_encrypted_txn_internal`](#@Specification_1_is_encrypted_txn_internal)
     -  [Function `monotonically_increasing_counter_internal`](#@Specification_1_monotonically_increasing_counter_internal)
     -  [Function `monotonically_increasing_counter_internal_for_test_only`](#@Specification_1_monotonically_increasing_counter_internal_for_test_only)
 
@@ -189,16 +192,6 @@ Represents the multisig payload.
 <a id="@Constants_0"></a>
 
 ## Constants
-
-
-<a id="0x1_transaction_context_EMONOTONICALLY_INCREASING_COUNTER_NOT_ENABLED"></a>
-
-The monotonically increasing counter is not enabled.
-
-
-<pre><code><b>const</b> <a href="transaction_context.md#0x1_transaction_context_EMONOTONICALLY_INCREASING_COUNTER_NOT_ENABLED">EMONOTONICALLY_INCREASING_COUNTER_NOT_ENABLED</a>: u64 = 3;
-</code></pre>
-
 
 
 <a id="0x1_transaction_context_EMONOTONICALLY_INCREASING_COUNTER_OVERFLOW"></a>
@@ -1000,6 +993,54 @@ Returns the inner entry function payload of the multisig payload.
 
 </details>
 
+<a id="0x1_transaction_context_is_encrypted_txn"></a>
+
+## Function `is_encrypted_txn`
+
+Returns whether the current transaction is an encrypted transaction.
+This function aborts if called outside of the transaction prologue, execution, or epilogue phases.
+
+
+<pre><code><b>public</b> <b>fun</b> <a href="transaction_context.md#0x1_transaction_context_is_encrypted_txn">is_encrypted_txn</a>(): bool
+</code></pre>
+
+
+
+<details>
+<summary>Implementation</summary>
+
+
+<pre><code><b>public</b> <b>fun</b> <a href="transaction_context.md#0x1_transaction_context_is_encrypted_txn">is_encrypted_txn</a>(): bool {
+    <a href="transaction_context.md#0x1_transaction_context_is_encrypted_txn_internal">is_encrypted_txn_internal</a>()
+}
+</code></pre>
+
+
+
+</details>
+
+<a id="0x1_transaction_context_is_encrypted_txn_internal"></a>
+
+## Function `is_encrypted_txn_internal`
+
+
+
+<pre><code><b>fun</b> <a href="transaction_context.md#0x1_transaction_context_is_encrypted_txn_internal">is_encrypted_txn_internal</a>(): bool
+</code></pre>
+
+
+
+<details>
+<summary>Implementation</summary>
+
+
+<pre><code><b>native</b> <b>fun</b> <a href="transaction_context.md#0x1_transaction_context_is_encrypted_txn_internal">is_encrypted_txn_internal</a>(): bool;
+</code></pre>
+
+
+
+</details>
+
 <a id="0x1_transaction_context_monotonically_increasing_counter"></a>
 
 ## Function `monotonically_increasing_counter`
@@ -1024,7 +1065,6 @@ When compiled for testing, this function bypasses feature checks and returns a s
     <b>if</b> (__COMPILE_FOR_TESTING__) {
         <a href="transaction_context.md#0x1_transaction_context_monotonically_increasing_counter_internal_for_test_only">monotonically_increasing_counter_internal_for_test_only</a>()
     } <b>else</b> {
-        <b>assert</b>!(<a href="../../aptos-stdlib/../move-stdlib/doc/features.md#0x1_features_is_monotonically_increasing_counter_enabled">features::is_monotonically_increasing_counter_enabled</a>(), <a href="../../aptos-stdlib/../move-stdlib/doc/error.md#0x1_error_invalid_state">error::invalid_state</a>(<a href="transaction_context.md#0x1_transaction_context_EMONOTONICALLY_INCREASING_COUNTER_NOT_ENABLED">EMONOTONICALLY_INCREASING_COUNTER_NOT_ENABLED</a>));
         <a href="transaction_context.md#0x1_transaction_context_monotonically_increasing_counter_internal">monotonically_increasing_counter_internal</a>(<a href="timestamp.md#0x1_timestamp_now_microseconds">timestamp::now_microseconds</a>())
     }
 }
@@ -1394,6 +1434,22 @@ the monotonically increasing behavior.
 
 
 <pre><code><b>fun</b> <a href="transaction_context.md#0x1_transaction_context_multisig_payload_internal">multisig_payload_internal</a>(): <a href="../../aptos-stdlib/../move-stdlib/doc/option.md#0x1_option_Option">option::Option</a>&lt;<a href="transaction_context.md#0x1_transaction_context_MultisigPayload">transaction_context::MultisigPayload</a>&gt;
+</code></pre>
+
+
+
+
+<pre><code><b>pragma</b> opaque;
+</code></pre>
+
+
+
+<a id="@Specification_1_is_encrypted_txn_internal"></a>
+
+### Function `is_encrypted_txn_internal`
+
+
+<pre><code><b>fun</b> <a href="transaction_context.md#0x1_transaction_context_is_encrypted_txn_internal">is_encrypted_txn_internal</a>(): bool
 </code></pre>
 
 

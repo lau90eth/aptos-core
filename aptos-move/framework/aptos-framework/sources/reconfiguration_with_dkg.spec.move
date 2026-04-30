@@ -63,7 +63,7 @@ spec aptos_framework::reconfiguration_with_dkg {
         include config_buffer::OnNewEpochRequirement<keyless_account::Groth16VerificationKey>;
     }
 
-    spec maybe_finish_reconfig_with_chunky_dkg(account: &signer) {
+    spec try_finalize_reconfig(account: &signer) {
         pragma verify = false;
     }
 
@@ -75,7 +75,11 @@ spec aptos_framework::reconfiguration_with_dkg {
         aborts_if false;
     }
 
-    spec finish_with_chunky_dkg_result(account: &signer, chunky_dkg_result: vector<u8>) {
+    spec finish_with_chunky_dkg_result(account: &signer, chunky_dkg_result: vector<u8>, encryption_key: vector<u8>) {
+        pragma verify = false;
+    }
+
+    spec try_advance_reconfig() {
         pragma verify = false;
     }
 }

@@ -484,6 +484,19 @@ module aptos_framework::stake {
     }
 
     #[view]
+    /// Return true if `owner` has an `OwnerCapability` resource.
+    public fun owner_cap_exists(owner: address): bool {
+        exists<OwnerCapability>(owner)
+    }
+
+    #[view]
+    /// Return the pool address controlled by the `OwnerCapability` at `owner`.
+    public fun get_pool_address_for_owner(owner: address): address acquires OwnerCapability {
+        assert_owner_cap_exists(owner);
+        OwnerCapability[owner].pool_address
+    }
+
+    #[view]
     /// Return the validator index for `pool_address`.
     public fun get_validator_index(pool_address: address): u64 acquires ValidatorConfig {
         assert_stake_pool_exists(pool_address);
@@ -839,14 +852,7 @@ module aptos_framework::stake {
         let old_operator = stake_pool.operator_address;
         stake_pool.operator_address = new_operator;
 
-        if (std::features::module_event_migration_enabled()) {
-            event::emit(SetOperator { pool_address, old_operator, new_operator });
-        } else {
-            event::emit_event(
-                &mut stake_pool.set_operator_events,
-                SetOperatorEvent { pool_address, old_operator, new_operator }
-            );
-        };
+        event::emit(SetOperator { pool_address, old_operator, new_operator });
     }
 
     /// Allows an owner to change the delegated voter of the stake pool.
@@ -916,19 +922,12 @@ module aptos_framework::stake {
 
         let (_, maximum_stake) =
             staking_config::get_required_stake(&staking_config::get());
-        let voting_power = get_next_epoch_voting_power(stake_pool);
+        let voting_power = get_voting_power(stake_pool);
         assert!(
             voting_power <= maximum_stake, error::invalid_argument(ESTAKE_EXCEEDS_MAX)
         );
 
-        if (std::features::module_event_migration_enabled()) {
-            event::emit(AddStake { pool_address, amount_added: amount });
-        } else {
-            event::emit_event(
-                &mut stake_pool.add_stake_events,
-                AddStakeEvent { pool_address, amount_added: amount }
-            );
-        };
+        event::emit(AddStake { pool_address, amount_added: amount });
     }
 
     /// Move `amount` of coins from pending_inactive to active.
@@ -959,14 +958,7 @@ module aptos_framework::stake {
         let reactivated_coins = coin::extract(&mut stake_pool.pending_inactive, amount);
         coin::merge(&mut stake_pool.active, reactivated_coins);
 
-        if (std::features::module_event_migration_enabled()) {
-            event::emit(ReactivateStake { pool_address, amount });
-        } else {
-            event::emit_event(
-                &mut stake_pool.reactivate_stake_events,
-                ReactivateStakeEvent { pool_address, amount }
-            );
-        };
+        event::emit(ReactivateStake { pool_address, amount });
     }
 
     /// Rotate the consensus key of the validator, it'll take effect in next epoch.
@@ -1003,24 +995,9 @@ module aptos_framework::stake {
         );
         validator_info.consensus_pubkey = new_consensus_pubkey;
 
-        if (std::features::module_event_migration_enabled()) {
-            event::emit(
-                RotateConsensusKey {
-                    pool_address,
-                    old_consensus_pubkey,
-                    new_consensus_pubkey
-                }
-            );
-        } else {
-            event::emit_event(
-                &mut stake_pool.rotate_consensus_key_events,
-                RotateConsensusKeyEvent {
-                    pool_address,
-                    old_consensus_pubkey,
-                    new_consensus_pubkey
-                }
-            );
-        };
+        event::emit(
+            RotateConsensusKey { pool_address, old_consensus_pubkey, new_consensus_pubkey }
+        );
     }
 
     /// Update the network and full node addresses of the validator. This only takes effect in the next epoch.
@@ -1048,28 +1025,15 @@ module aptos_framework::stake {
         let old_fullnode_addresses = validator_info.fullnode_addresses;
         validator_info.fullnode_addresses = new_fullnode_addresses;
 
-        if (std::features::module_event_migration_enabled()) {
-            event::emit(
-                UpdateNetworkAndFullnodeAddresses {
-                    pool_address,
-                    old_network_addresses,
-                    new_network_addresses,
-                    old_fullnode_addresses,
-                    new_fullnode_addresses
-                }
-            );
-        } else {
-            event::emit_event(
-                &mut stake_pool.update_network_and_fullnode_addresses_events,
-                UpdateNetworkAndFullnodeAddressesEvent {
-                    pool_address,
-                    old_network_addresses,
-                    new_network_addresses,
-                    old_fullnode_addresses,
-                    new_fullnode_addresses
-                }
-            );
-        };
+        event::emit(
+            UpdateNetworkAndFullnodeAddresses {
+                pool_address,
+                old_network_addresses,
+                new_network_addresses,
+                old_fullnode_addresses,
+                new_fullnode_addresses
+            }
+        );
     }
 
     /// Similar to increase_lockup_with_cap but will use ownership capability from the signing account.
@@ -1099,24 +1063,9 @@ module aptos_framework::stake {
         );
         stake_pool.locked_until_secs = new_locked_until_secs;
 
-        if (std::features::module_event_migration_enabled()) {
-            event::emit(
-                IncreaseLockup {
-                    pool_address,
-                    old_locked_until_secs,
-                    new_locked_until_secs
-                }
-            );
-        } else {
-            event::emit_event(
-                &mut stake_pool.increase_lockup_events,
-                IncreaseLockupEvent {
-                    pool_address,
-                    old_locked_until_secs,
-                    new_locked_until_secs
-                }
-            );
-        }
+        event::emit(
+            IncreaseLockup { pool_address, old_locked_until_secs, new_locked_until_secs }
+        );
     }
 
     /// This can only called by the operator of the validator/staking pool.
@@ -1155,7 +1104,19 @@ module aptos_framework::stake {
 
         let config = staking_config::get();
         let (minimum_stake, maximum_stake) = staking_config::get_required_stake(&config);
-        let voting_power = get_next_epoch_voting_power(stake_pool);
+        // Settle any pending_inactive whose lockup has already expired so it is not counted
+        // as voting power. An inactive validator's pending_inactive is never processed by
+        // update_stake_pool, so we must do it here before evaluating the minimum stake.
+        // Only settle when locked_until_secs > 0 (i.e., a lockup was ever explicitly set);
+        // a value of 0 means the pool was just created and the lockup has not been initialised yet.
+        if (stake_pool.locked_until_secs > 0
+            && timestamp::now_seconds() >= stake_pool.locked_until_secs) {
+            coin::merge(
+                &mut stake_pool.inactive,
+                coin::extract_all(&mut stake_pool.pending_inactive)
+            );
+        };
+        let voting_power = get_voting_power(stake_pool);
         assert!(voting_power >= minimum_stake, error::invalid_argument(ESTAKE_TOO_LOW));
         assert!(voting_power <= maximum_stake, error::invalid_argument(ESTAKE_TOO_HIGH));
 
@@ -1182,14 +1143,7 @@ module aptos_framework::stake {
             error::invalid_argument(EVALIDATOR_SET_TOO_LARGE)
         );
 
-        if (std::features::module_event_migration_enabled()) {
-            event::emit(JoinValidatorSet { pool_address });
-        } else {
-            event::emit_event(
-                &mut stake_pool.join_validator_set_events,
-                JoinValidatorSetEvent { pool_address }
-            );
-        }
+        event::emit(JoinValidatorSet { pool_address });
     }
 
     /// Similar to unlock_with_cap but will use ownership capability from the signing account.
@@ -1218,14 +1172,7 @@ module aptos_framework::stake {
         let unlocked_stake = coin::extract(&mut stake_pool.active, amount);
         coin::merge<AptosCoin>(&mut stake_pool.pending_inactive, unlocked_stake);
 
-        if (std::features::module_event_migration_enabled()) {
-            event::emit(UnlockStake { pool_address, amount_unlocked: amount });
-        } else {
-            event::emit_event(
-                &mut stake_pool.unlock_stake_events,
-                UnlockStakeEvent { pool_address, amount_unlocked: amount }
-            );
-        };
+        event::emit(UnlockStake { pool_address, amount_unlocked: amount });
     }
 
     /// Withdraw from `account`'s inactive stake.
@@ -1262,14 +1209,7 @@ module aptos_framework::stake {
         withdraw_amount = min(withdraw_amount, coin::value(&stake_pool.inactive));
         if (withdraw_amount == 0) return coin::zero<AptosCoin>();
 
-        if (std::features::module_event_migration_enabled()) {
-            event::emit(WithdrawStake { pool_address, amount_withdrawn: withdraw_amount });
-        } else {
-            event::emit_event(
-                &mut stake_pool.withdraw_stake_events,
-                WithdrawStakeEvent { pool_address, amount_withdrawn: withdraw_amount }
-            );
-        };
+        event::emit(WithdrawStake { pool_address, amount_withdrawn: withdraw_amount });
 
         coin::extract(&mut stake_pool.inactive, withdraw_amount)
     }
@@ -1309,7 +1249,7 @@ module aptos_framework::stake {
             // Decrease the voting power increase as the pending validator's voting power was added when they requested
             // to join. Now that they changed their mind, their voting power should not affect the joining limit of this
             // epoch.
-            let validator_stake = (get_next_epoch_voting_power(stake_pool) as u128);
+            let validator_stake = (get_voting_power(stake_pool) as u128);
             // total_joining_power should be larger than validator_stake but just in case there has been a small
             // rounding error somewhere that can lead to an underflow, we still want to allow this transaction to
             // succeed.
@@ -1331,14 +1271,7 @@ module aptos_framework::stake {
             );
             validator_set.pending_inactive.push_back(validator_info);
 
-            if (std::features::module_event_migration_enabled()) {
-                event::emit(LeaveValidatorSet { pool_address });
-            } else {
-                event::emit_event(
-                    &mut stake_pool.leave_validator_set_events,
-                    LeaveValidatorSetEvent { pool_address }
-                );
-            };
+            event::emit(LeaveValidatorSet { pool_address });
         };
     }
 
@@ -1435,6 +1368,23 @@ module aptos_framework::stake {
         validator_set.pending_inactive.for_each_ref(|validator| {
             let validator: &ValidatorInfo = validator;
             update_stake_pool(validator_perf, validator.addr, &config);
+        });
+
+        // Settle expired pending_inactive for pending_active validators before activating them.
+        // update_stake_pool is not called for pending_active validators, so without this step
+        // their expired pending_inactive would be incorrectly counted as voting power, causing
+        // a mismatch with the DKG validator set (which excludes expired pending_inactive) and
+        // an out-of-bounds panic in the epoch manager.
+        validator_set.pending_active.for_each_ref(|validator| {
+            let validator: &ValidatorInfo = validator;
+            let stake_pool = borrow_global_mut<StakePool>(validator.addr);
+            if (stake_pool.locked_until_secs > 0
+                && get_reconfig_start_time_secs() >= stake_pool.locked_until_secs) {
+                coin::merge(
+                    &mut stake_pool.inactive,
+                    coin::extract_all(&mut stake_pool.pending_inactive)
+                );
+            };
         });
 
         // Activate currently pending_active validators.
@@ -1965,19 +1915,12 @@ module aptos_framework::stake {
             );
         };
 
-        if (std::features::module_event_migration_enabled()) {
-            event::emit(DistributeRewards { pool_address, rewards_amount });
-        } else {
-            event::emit_event(
-                &mut stake_pool.distribute_rewards_events,
-                DistributeRewardsEvent { pool_address, rewards_amount }
-            );
-        };
+        event::emit(DistributeRewards { pool_address, rewards_amount });
     }
 
     /// Assuming we are in a middle of a reconfiguration (no matter it is immediate or async), get its start time.
     fun get_reconfig_start_time_secs(): u64 {
-        if (reconfiguration_state::is_initialized()) {
+        if (reconfiguration_state::is_in_progress()) {
             reconfiguration_state::start_time_secs()
         } else {
             timestamp::now_seconds()
@@ -2065,12 +2008,14 @@ module aptos_framework::stake {
     fun generate_validator_info(
         addr: address, stake_pool: &StakePool, config: ValidatorConfig
     ): ValidatorInfo {
-        let voting_power = get_next_epoch_voting_power(stake_pool);
+        let voting_power = get_voting_power(stake_pool);
         ValidatorInfo { addr, voting_power, config }
     }
 
-    /// Returns validator's next epoch voting power, including pending_active, active, and pending_inactive stake.
-    fun get_next_epoch_voting_power(stake_pool: &StakePool): u64 {
+    /// Returns the sum of all non-inactive stake (active + pending_active + pending_inactive).
+    /// This equals the actual voting power for the next epoch only when called after expired
+    /// pending_inactive has been settled to inactive (e.g. in on_new_epoch or join_validator_set).
+    fun get_voting_power(stake_pool: &StakePool): u64 {
         let value_pending_active = coin::value(&stake_pool.pending_active);
         let value_active = coin::value(&stake_pool.active);
         let value_pending_inactive = coin::value(&stake_pool.pending_inactive);

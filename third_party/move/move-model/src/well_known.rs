@@ -1,6 +1,7 @@
-// Copyright (c) The Diem Core Contributors
-// Copyright (c) The Move Contributors
-// SPDX-License-Identifier: Apache-2.0
+// Parts of the file are Copyright (c) The Diem Core Contributors
+// Parts of the file are Copyright (c) The Move Contributors
+// Parts of the file are Copyright (c) Aptos Foundation
+// All Aptos Foundation code and content is licensed pursuant to the Innovation-Enabling Source Code License, available at https://github.com/aptos-labs/aptos-core/blob/main/LICENSE
 
 //! Names of well-known functions or attributes.
 //!
@@ -25,18 +26,14 @@ pub fn is_verify_only_attribute_name(s: &str) -> bool {
     s == "verify_only"
 }
 
-// For public struct/enum APIs
-pub const PUBLIC_STRUCT_DELIMITER: &str = "$";
-pub const PACK: &str = "pack";
-pub const UNPACK: &str = "unpack";
-pub const TEST_VARIANT: &str = "test_variant";
-pub const PARAM_NAME_FOR_STRUCT_API: &str = "_s";
-
 pub const VECTOR_MODULE: &str = "vector";
+pub const SIGNER_MODULE: &str = "signer";
+pub const VECTOR_BORROW: &str = "vector::borrow";
 pub const VECTOR_BORROW_MUT: &str = "vector::borrow_mut";
+pub const BORROW_GLOBAL: &str = "borrow_global";
+pub const BORROW_GLOBAL_MUT: &str = "borrow_global_mut";
 pub const EVENT_EMIT_EVENT: &str = "event::emit_event";
-pub const BORROW_NAME: &str = "borrow";
-pub const BORROW_MUT_NAME: &str = "borrow_mut";
+pub const EVENT_EMIT: &str = "event::emit";
 /// Functions in the std::vector module that are implemented as bytecode instructions.
 pub const VECTOR_FUNCS_WITH_BYTECODE_INSTRS: &[&str] = &[
     "empty",
