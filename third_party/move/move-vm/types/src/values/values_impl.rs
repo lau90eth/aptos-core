@@ -1,6 +1,7 @@
-// Copyright (c) The Diem Core Contributors
-// Copyright (c) The Move Contributors
-// SPDX-License-Identifier: Apache-2.0
+// Parts of the file are Copyright (c) The Diem Core Contributors
+// Parts of the file are Copyright (c) The Move Contributors
+// Parts of the file are Copyright (c) Aptos Foundation
+// All Aptos Foundation code and content is licensed pursuant to the Innovation-Enabling Source Code License, available at https://github.com/aptos-labs/aptos-core/blob/main/LICENSE
 
 #![allow(clippy::arc_with_non_send_sync)]
 
@@ -847,20 +848,26 @@ impl Value {
 impl Value {
     #[cfg_attr(feature = "force-inline", inline(always))]
     pub fn equals(&self, other: &Self) -> PartialVMResult<bool> {
-        self.equals_with_depth(other, 1, Some(DEFAULT_MAX_VM_VALUE_NESTED_DEPTH))
+        self.equals_with_depth(other, 1, Some(DEFAULT_MAX_VM_VALUE_NESTED_DEPTH), true)
     }
 
     #[cfg_attr(feature = "force-inline", inline(always))]
     pub fn compare(&self, other: &Self) -> PartialVMResult<Ordering> {
-        self.compare_with_depth(other, 1, Some(DEFAULT_MAX_VM_VALUE_NESTED_DEPTH))
+        self.compare_with_depth(other, 1, Some(DEFAULT_MAX_VM_VALUE_NESTED_DEPTH), true)
     }
 
+    /// Returns true if two Move values are equal.
+    ///
+    /// Additional parameters:
+    ///   - Maximum allowed depth of the traversal of value trees.
+    ///   - Whether to include closure mask in closure comparison or not.
     #[cfg_attr(feature = "force-inline", inline(always))]
     pub fn equals_with_depth(
         &self,
         other: &Self,
         depth: u64,
         max_depth: Option<u64>,
+        include_closure_mask: bool,
     ) -> PartialVMResult<bool> {
         use Value::*;
 
@@ -881,11 +888,15 @@ impl Value {
             (Bool(l), Bool(r)) => l == r,
             (Address(l), Address(r)) => l == r,
 
-            (Container(l), Container(r)) => l.equals(r, depth, max_depth)?,
+            (Container(l), Container(r)) => l.equals(r, depth, max_depth, include_closure_mask)?,
 
             // We count references as +1 in nesting, hence increasing the depth.
-            (ContainerRef(l), ContainerRef(r)) => l.equals(r, depth + 1, max_depth)?,
-            (IndexedRef(l), IndexedRef(r)) => l.equals(r, depth + 1, max_depth)?,
+            (ContainerRef(l), ContainerRef(r)) => {
+                l.equals(r, depth + 1, max_depth, include_closure_mask)?
+            },
+            (IndexedRef(l), IndexedRef(r)) => {
+                l.equals(r, depth + 1, max_depth, include_closure_mask)?
+            },
 
             // Disallow equality for delayed values. The rationale behind this
             // semantics is that identifiers might not be deterministic, and
@@ -899,10 +910,11 @@ impl Value {
 
             (ClosureValue(Closure(fun1, captured1)), ClosureValue(Closure(fun2, captured2))) => {
                 if fun1.cmp_dyn(fun2.as_ref())? == Ordering::Equal
+                    && (!include_closure_mask || fun1.closure_mask() == fun2.closure_mask())
                     && captured1.len() == captured2.len()
                 {
                     for (v1, v2) in captured1.iter().zip(captured2.iter()) {
-                        if !v1.equals_with_depth(v2, depth + 1, max_depth)? {
+                        if !v1.equals_with_depth(v2, depth + 1, max_depth, include_closure_mask)? {
                             return Ok(false);
                         }
                     }
@@ -944,11 +956,17 @@ impl Value {
         Ok(res)
     }
 
+    /// Compares two Move values.
+    ///
+    /// Additional parameters:
+    ///   - Maximum allowed depth of the traversal of value trees.
+    ///   - Whether to include closure mask in closure comparison or not.
     pub fn compare_with_depth(
         &self,
         other: &Self,
         depth: u64,
         max_depth: Option<u64>,
+        include_closure_mask: bool,
     ) -> PartialVMResult<Ordering> {
         use Value::*;
 
@@ -969,11 +987,15 @@ impl Value {
             (Bool(l), Bool(r)) => l.cmp(r),
             (Address(l), Address(r)) => l.cmp(r),
 
-            (Container(l), Container(r)) => l.compare(r, depth, max_depth)?,
+            (Container(l), Container(r)) => l.compare(r, depth, max_depth, include_closure_mask)?,
 
             // We count references as +1 in nesting, hence increasing the depth.
-            (ContainerRef(l), ContainerRef(r)) => l.compare(r, depth + 1, max_depth)?,
-            (IndexedRef(l), IndexedRef(r)) => l.compare(r, depth + 1, max_depth)?,
+            (ContainerRef(l), ContainerRef(r)) => {
+                l.compare(r, depth + 1, max_depth, include_closure_mask)?
+            },
+            (IndexedRef(l), IndexedRef(r)) => {
+                l.compare(r, depth + 1, max_depth, include_closure_mask)?
+            },
 
             // Disallow comparison for delayed values.
             // (see `ValueImpl::equals` above for details on reasoning behind it)
@@ -983,10 +1005,14 @@ impl Value {
             },
 
             (ClosureValue(Closure(fun1, captured1)), ClosureValue(Closure(fun2, captured2))) => {
-                let o = fun1.cmp_dyn(fun2.as_ref())?;
+                let mut o = fun1.cmp_dyn(fun2.as_ref())?;
+                if include_closure_mask {
+                    o = o.then_with(|| fun1.closure_mask().cmp(&fun2.closure_mask()));
+                }
                 if o == Ordering::Equal {
                     for (v1, v2) in captured1.iter().zip(captured2.iter()) {
-                        let o = v1.compare_with_depth(v2, depth + 1, max_depth)?;
+                        let o =
+                            v1.compare_with_depth(v2, depth + 1, max_depth, include_closure_mask)?;
                         if o != Ordering::Equal {
                             return Ok(o);
                         }
@@ -1036,7 +1062,7 @@ impl Value {
         other: &Self,
         max_depth: u64,
     ) -> PartialVMResult<bool> {
-        self.equals_with_depth(other, 1, Some(max_depth))
+        self.equals_with_depth(other, 1, Some(max_depth), true)
     }
 
     // Test-only API to test depth checks.
@@ -1046,12 +1072,18 @@ impl Value {
         other: &Self,
         max_depth: u64,
     ) -> PartialVMResult<Ordering> {
-        self.compare_with_depth(other, 1, Some(max_depth))
+        self.compare_with_depth(other, 1, Some(max_depth), true)
     }
 }
 
 impl Container {
-    fn equals(&self, other: &Self, depth: u64, max_depth: Option<u64>) -> PartialVMResult<bool> {
+    fn equals(
+        &self,
+        other: &Self,
+        depth: u64,
+        max_depth: Option<u64>,
+        include_closure_mask: bool,
+    ) -> PartialVMResult<bool> {
         use Container::*;
 
         let res = match (self, other) {
@@ -1063,7 +1095,7 @@ impl Container {
                     return Ok(false);
                 }
                 for (v1, v2) in l.iter().zip(r.iter()) {
-                    if !v1.equals_with_depth(v2, depth + 1, max_depth)? {
+                    if !v1.equals_with_depth(v2, depth + 1, max_depth, include_closure_mask)? {
                         return Ok(false);
                     }
                 }
@@ -1118,6 +1150,7 @@ impl Container {
         other: &Self,
         depth: u64,
         max_depth: Option<u64>,
+        include_closure_mask: bool,
     ) -> PartialVMResult<Ordering> {
         use Container::*;
 
@@ -1127,7 +1160,8 @@ impl Container {
                 let r = &r.borrow();
 
                 for (v1, v2) in l.iter().zip(r.iter()) {
-                    let value_cmp = v1.compare_with_depth(v2, depth + 1, max_depth)?;
+                    let value_cmp =
+                        v1.compare_with_depth(v2, depth + 1, max_depth, include_closure_mask)?;
                     if value_cmp.is_ne() {
                         return Ok(value_cmp);
                     }
@@ -1182,10 +1216,17 @@ impl Container {
 
 impl ContainerRef {
     #[cfg_attr(feature = "force-inline", inline(always))]
-    fn equals(&self, other: &Self, depth: u64, max_depth: Option<u64>) -> PartialVMResult<bool> {
+    fn equals(
+        &self,
+        other: &Self,
+        depth: u64,
+        max_depth: Option<u64>,
+        include_closure_mask: bool,
+    ) -> PartialVMResult<bool> {
         // Note: the depth passed in accounts for the container.
         check_depth(depth, max_depth)?;
-        self.container().equals(other.container(), depth, max_depth)
+        self.container()
+            .equals(other.container(), depth, max_depth, include_closure_mask)
     }
 
     fn compare(
@@ -1193,17 +1234,24 @@ impl ContainerRef {
         other: &Self,
         depth: u64,
         max_depth: Option<u64>,
+        include_closure_mask: bool,
     ) -> PartialVMResult<Ordering> {
         // Note: the depth passed in accounts for the container.
         check_depth(depth, max_depth)?;
         self.container()
-            .compare(other.container(), depth, max_depth)
+            .compare(other.container(), depth, max_depth, include_closure_mask)
     }
 }
 
 impl IndexedRef {
     // note(inline): do not inline, too big
-    fn equals(&self, other: &Self, depth: u64, max_depth: Option<u64>) -> PartialVMResult<bool> {
+    fn equals(
+        &self,
+        other: &Self,
+        depth: u64,
+        max_depth: Option<u64>,
+        include_closure_mask: bool,
+    ) -> PartialVMResult<bool> {
         use Container::*;
 
         self.check_tag()?;
@@ -1228,6 +1276,7 @@ impl IndexedRef {
                 &r2.borrow()[other_index],
                 depth + 1,
                 max_depth,
+                include_closure_mask,
             )?,
 
             (VecU8(r1), VecU8(r2)) => r1.borrow()[self_index] == r2.borrow()[other_index],
@@ -1376,6 +1425,7 @@ impl IndexedRef {
         other: &Self,
         depth: u64,
         max_depth: Option<u64>,
+        include_closure_mask: bool,
     ) -> PartialVMResult<Ordering> {
         use Container::*;
 
@@ -1401,6 +1451,7 @@ impl IndexedRef {
                 &r2.borrow()[other_index],
                 depth + 1,
                 max_depth,
+                include_closure_mask,
             )?,
 
             (VecU8(r1), VecU8(r2)) => r1.borrow()[self_index].cmp(&r2.borrow()[other_index]),
@@ -3757,11 +3808,13 @@ impl VectorRef {
     }
 
     /// Returns a RefCell reference to the underlying vector of a `&vector<u8>` value.
-    pub fn as_bytes_ref(&self) -> std::cell::Ref<'_, Vec<u8>> {
-        let c = self.0.container();
-        match c {
-            Container::VecU8(r) => r.borrow(),
-            _ => panic!("can only be called on vector<u8>"),
+    pub fn as_bytes_ref(&self) -> PartialVMResult<std::cell::Ref<'_, Vec<u8>>> {
+        if let Container::VecU8(r) = self.0.container() {
+            Ok(r.borrow())
+        } else {
+            Err(PartialVMError::new_invariant_violation(
+                "can only be called on vector<u8>",
+            ))
         }
     }
 
@@ -4569,6 +4622,17 @@ impl Display for Locals {
     }
 }
 
+/// Type-level field information for annotated local-variable display in the
+/// debugger.  Passed per-local to [`debug::print_locals_with_info`].
+pub enum LocalTypeInfo {
+    /// Regular struct: field names in declaration order.
+    Struct(Vec<String>),
+    /// Enum: `(variant_name, field_names)` indexed by variant tag (0-based).
+    /// The runtime stores enum values as `[u16_tag, field0, field1, …]`, so
+    /// index 0 here corresponds to tag value `0`.
+    Enum(Vec<(String, Vec<String>)>),
+}
+
 #[allow(dead_code)]
 pub mod debug {
     use super::*;
@@ -4786,6 +4850,135 @@ pub mod debug {
             debug_writeln!(buf)?;
         }
         Ok(())
+    }
+
+    /// Extended locals printer that shows separate Parameters / Locals sections
+    /// with optional variable names and optional per-local type information.
+    ///
+    /// * `param_count` – how many of the first locals are parameters.
+    /// * `names`       – combined parameter + local names (may be shorter than
+    ///                   the actual local count; missing entries fall back to `_`).
+    /// * `type_info`   – for each local index, optional [`LocalTypeInfo`] that
+    ///                   annotates struct fields or enum variants in the output.
+    ///                   Pass `None` to skip annotation for all locals.
+    pub fn print_locals_with_info<B: Write>(
+        buf: &mut B,
+        locals: &Locals,
+        compact: bool,
+        param_count: usize,
+        names: Option<&[String]>,
+        type_info: Option<&[Option<LocalTypeInfo>]>,
+    ) -> PartialVMResult<()> {
+        let locals_ref = locals.0.borrow();
+        let total = locals_ref.len();
+
+        // ── Parameters section ────────────────────────────────────────────────
+        let mut printed_header = false;
+        for idx in 0..param_count.min(total) {
+            let val = &locals_ref[idx];
+            if compact && matches!(val, Value::Invalid) {
+                continue;
+            }
+            if !printed_header {
+                debug_writeln!(buf, "        Parameters:")?;
+                printed_header = true;
+            }
+            let name = names
+                .and_then(|n| n.get(idx))
+                .map(|s| s.as_str())
+                .unwrap_or("_");
+            debug_write!(buf, "            [{}] {}: ", idx, name)?;
+            print_value_with_type_info(
+                buf,
+                val,
+                type_info.and_then(|t| t.get(idx)).and_then(|o| o.as_ref()),
+            )?;
+            debug_writeln!(buf)?;
+        }
+
+        // ── Locals section ────────────────────────────────────────────────────
+        printed_header = false;
+        for idx in param_count..total {
+            let val = &locals_ref[idx];
+            if compact && matches!(val, Value::Invalid) {
+                continue;
+            }
+            if !printed_header {
+                debug_writeln!(buf, "        Locals:")?;
+                printed_header = true;
+            }
+            let name = names
+                .and_then(|n| n.get(idx))
+                .map(|s| s.as_str())
+                .unwrap_or("_");
+            debug_write!(buf, "            [{}] {}: ", idx, name)?;
+            print_value_with_type_info(
+                buf,
+                val,
+                type_info.and_then(|t| t.get(idx)).and_then(|o| o.as_ref()),
+            )?;
+            debug_writeln!(buf)?;
+        }
+
+        Ok(())
+    }
+
+    /// Print `val` with optional [`LocalTypeInfo`] for annotating struct fields
+    /// or enum variants.  Nested values are still printed positionally.
+    fn print_value_with_type_info<B: Write>(
+        buf: &mut B,
+        val: &Value,
+        info: Option<&LocalTypeInfo>,
+    ) -> PartialVMResult<()> {
+        match (val, info) {
+            // ── Struct with named fields ──────────────────────────────────────
+            (Value::Container(Container::Struct(r)), Some(LocalTypeInfo::Struct(names)))
+                if !names.is_empty() =>
+            {
+                debug_write!(buf, "{{ ")?;
+                let fields = r.borrow();
+                for (i, field_val) in fields.iter().enumerate() {
+                    if i > 0 {
+                        debug_write!(buf, ", ")?;
+                    }
+                    let fname = names.get(i).map(|s| s.as_str()).unwrap_or("_");
+                    debug_write!(buf, "{}: ", fname)?;
+                    print_value_impl(buf, field_val)?;
+                }
+                debug_write!(buf, " }}")
+            },
+            // ── Enum variant: [u16_tag, field0, field1, …] ───────────────────
+            (Value::Container(Container::Struct(r)), Some(LocalTypeInfo::Enum(variants)))
+                if !variants.is_empty() =>
+            {
+                let fields = r.borrow();
+                let tag = match fields.first() {
+                    Some(Value::U16(t)) => *t as usize,
+                    _ => return print_value_impl(buf, val),
+                };
+                match variants.get(tag) {
+                    Some((variant_name, field_names)) => {
+                        debug_write!(buf, "{}", variant_name)?;
+                        let payload = &fields[1..];
+                        if !payload.is_empty() {
+                            debug_write!(buf, " {{ ")?;
+                            for (i, field_val) in payload.iter().enumerate() {
+                                if i > 0 {
+                                    debug_write!(buf, ", ")?;
+                                }
+                                let fname = field_names.get(i).map(|s| s.as_str()).unwrap_or("_");
+                                debug_write!(buf, "{}: ", fname)?;
+                                print_value_impl(buf, field_val)?;
+                            }
+                            debug_write!(buf, " }}")?;
+                        }
+                        Ok(())
+                    },
+                    None => print_value_impl(buf, val),
+                }
+            },
+            _ => print_value_impl(buf, val),
+        }
     }
 
     pub fn print_value<B: Write>(buf: &mut B, val: &Value) -> PartialVMResult<()> {
@@ -5252,7 +5445,7 @@ impl<'d> serde::de::DeserializeSeed<'d> for DeserializationSeed<'_, &MoveStructL
             },
             MoveStructLayout::WithFields(_)
             | MoveStructLayout::WithTypes { .. }
-            | MoveStructLayout::WithVariants(_) => {
+            | MoveStructLayout::WithVariants { .. } => {
                 Err(D::Error::custom("cannot deserialize from decorated type"))
             },
         }

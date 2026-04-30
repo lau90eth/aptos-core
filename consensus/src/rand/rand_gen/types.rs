@@ -28,12 +28,6 @@ use std::{collections::HashSet, fmt::Debug, sync::Arc};
 pub const NUM_THREADS_FOR_WVUF_DERIVATION: usize = 8;
 pub const FUTURE_ROUNDS_TO_ACCEPT: u64 = 200;
 
-#[derive(PartialEq)]
-pub enum PathType {
-    Fast,
-    Slow,
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(super) struct MockShare;
 
@@ -151,31 +145,28 @@ impl TShare for Share {
 
         // Try batch verification: build proof and verify in one shot.
         // If any step fails, fall back to individual verification.
-        let batch_ok = Self::build_apks_and_proofs(&shares_vec, rand_config)
-            .and_then(|apks_and_proofs| {
-                let proof = WVUF::aggregate_shares(&rand_config.wconfig, &apks_and_proofs);
-                let metadata_serialized = bcs::to_bytes(rand_metadata)
-                    .map_err(|e| anyhow!("metadata serialization failed: {e}"))?;
-                WVUF::verify_proof(
-                    &rand_config.vuf_pp,
-                    rand_config.pk(),
-                    &rand_config.get_all_certified_apk(),
-                    metadata_serialized.as_slice(),
-                    &proof,
-                    THREAD_MANAGER.get_non_exe_cpu_pool(),
-                )
-            })
-            .is_ok();
-
-        if batch_ok {
-            return HashSet::new();
+        match Self::build_apks_and_proofs(&shares_vec, rand_config).and_then(|apks_and_proofs| {
+            let proof = WVUF::aggregate_shares(&rand_config.wconfig, &apks_and_proofs);
+            let metadata_serialized = bcs::to_bytes(rand_metadata)
+                .map_err(|e| anyhow!("metadata serialization failed: {e}"))?;
+            WVUF::verify_proof(
+                &rand_config.vuf_pp,
+                rand_config.pk(),
+                &rand_config.get_all_certified_apk(),
+                metadata_serialized.as_slice(),
+                &proof,
+                THREAD_MANAGER.get_non_exe_cpu_pool(),
+            )
+        }) {
+            Ok(()) => return HashSet::new(),
+            Err(e) => {
+                // Batch verification failed; fall back to individual verification
+                warn!(
+                    "Batch verification failed for round {}, falling back to individual verification: {e}",
+                    rand_metadata.round
+                );
+            },
         }
-
-        // Batch verification failed; fall back to individual verification
-        warn!(
-            "Batch verification failed for round {}, falling back to individual verification",
-            rand_metadata.round
-        );
 
         let verification_results: Vec<bool> = THREAD_MANAGER.get_non_exe_cpu_pool().install(|| {
             shares_vec
@@ -237,7 +228,7 @@ impl Share {
 }
 
 impl TAugmentedData for AugmentedData {
-    fn generate(rand_config: &RandConfig, fast_rand_config: &Option<RandConfig>) -> AugData<Self>
+    fn generate(rand_config: &RandConfig) -> AugData<Self>
     where
         Self: Sized,
     {
@@ -246,60 +237,25 @@ impl TAugmentedData for AugmentedData {
             .add_certified_delta(&rand_config.author(), delta.clone())
             .expect("Add self delta should succeed");
 
-        let fast_delta = if let Some(fast_config) = fast_rand_config.as_ref() {
-            let fast_delta = fast_config.get_my_delta().clone();
-            fast_config
-                .add_certified_delta(&rand_config.author(), fast_delta.clone())
-                .expect("Add self delta for fast path should succeed");
-            Some(fast_delta)
-        } else {
-            None
-        };
-
         let data = AugmentedData {
             delta: delta.clone(),
-            fast_delta,
+            fast_delta: None,
         };
         AugData::new(rand_config.epoch(), rand_config.author(), data)
     }
 
-    fn augment(
-        &self,
-        rand_config: &RandConfig,
-        fast_rand_config: &Option<RandConfig>,
-        author: &Author,
-    ) {
-        let AugmentedData { delta, fast_delta } = self;
+    fn augment(&self, rand_config: &RandConfig, author: &Author) {
+        let AugmentedData { delta, .. } = self;
         rand_config
             .add_certified_delta(author, delta.clone())
             .expect("Add delta should succeed");
-
-        if let (Some(config), Some(fast_delta)) = (fast_rand_config, fast_delta) {
-            config
-                .add_certified_delta(author, fast_delta.clone())
-                .expect("Add delta for fast path should succeed");
-        }
     }
 
-    fn verify(
-        &self,
-        rand_config: &RandConfig,
-        fast_rand_config: &Option<RandConfig>,
-        author: &Author,
-    ) -> anyhow::Result<()> {
+    fn verify(&self, rand_config: &RandConfig, author: &Author) -> anyhow::Result<()> {
         rand_config
             .derive_apk(author, self.delta.clone())
             .map(|_| ())?;
-
-        ensure!(
-            self.fast_delta.is_some() == fast_rand_config.is_some(),
-            "Fast path delta should be present iff fast_rand_config is present."
-        );
-        if let (Some(config), Some(fast_delta)) = (fast_rand_config, self.fast_delta.as_ref()) {
-            config.derive_apk(author, fast_delta.clone()).map(|_| ())
-        } else {
-            Ok(())
-        }
+        Ok(())
     }
 }
 
@@ -333,27 +289,16 @@ impl TShare for MockShare {
 }
 
 impl TAugmentedData for MockAugData {
-    fn generate(rand_config: &RandConfig, _fast_rand_config: &Option<RandConfig>) -> AugData<Self>
+    fn generate(rand_config: &RandConfig) -> AugData<Self>
     where
         Self: Sized,
     {
         AugData::new(rand_config.epoch(), rand_config.author(), Self)
     }
 
-    fn augment(
-        &self,
-        _rand_config: &RandConfig,
-        _fast_rand_config: &Option<RandConfig>,
-        _author: &Author,
-    ) {
-    }
+    fn augment(&self, _rand_config: &RandConfig, _author: &Author) {}
 
-    fn verify(
-        &self,
-        _rand_config: &RandConfig,
-        _fast_rand_config: &Option<RandConfig>,
-        _author: &Author,
-    ) -> anyhow::Result<()> {
+    fn verify(&self, _rand_config: &RandConfig, _author: &Author) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -397,23 +342,13 @@ pub trait TShare:
 pub trait TAugmentedData:
     Clone + Debug + PartialEq + Send + Sync + Serialize + DeserializeOwned + 'static
 {
-    fn generate(rand_config: &RandConfig, fast_rand_config: &Option<RandConfig>) -> AugData<Self>
+    fn generate(rand_config: &RandConfig) -> AugData<Self>
     where
         Self: Sized;
 
-    fn augment(
-        &self,
-        rand_config: &RandConfig,
-        fast_rand_config: &Option<RandConfig>,
-        author: &Author,
-    );
+    fn augment(&self, rand_config: &RandConfig, author: &Author);
 
-    fn verify(
-        &self,
-        rand_config: &RandConfig,
-        fast_rand_config: &Option<RandConfig>,
-        author: &Author,
-    ) -> anyhow::Result<()>;
+    fn verify(&self, rand_config: &RandConfig, author: &Author) -> anyhow::Result<()>;
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -463,7 +398,17 @@ impl<S: TShare> RandShare<S> {
         self.share.verify(rand_config, &self.metadata, &self.author)
     }
 
-    pub fn optimistic_verify(&self, rand_config: &RandConfig) -> anyhow::Result<()> {
+    pub fn optimistic_verify(
+        &self,
+        rand_config: &RandConfig,
+        sender: &Author,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            &self.author == sender,
+            "[RandShare] Share author {:?} does not match sender {:?}",
+            self.author,
+            sender,
+        );
         if rand_config.should_verify_optimistically(&self.author) {
             // Still perform cheap structural checks (author exists, APK certified)
             // to prevent invalid shares from reaching aggregation where they would
@@ -500,53 +445,6 @@ impl RequestShare {
 
     pub fn rand_metadata(&self) -> &RandMetadata {
         &self.metadata
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct FastShare<S> {
-    pub share: RandShare<S>,
-}
-
-impl<S: TShare> FastShare<S> {
-    pub fn new(share: RandShare<S>) -> Self {
-        Self { share }
-    }
-
-    pub fn author(&self) -> &Author {
-        self.share.author()
-    }
-
-    pub fn rand_share(&self) -> RandShare<S> {
-        self.share.clone()
-    }
-
-    pub fn share(&self) -> &S {
-        self.share.share()
-    }
-
-    pub fn metadata(&self) -> &RandMetadata {
-        self.share.metadata()
-    }
-
-    pub fn round(&self) -> Round {
-        self.share.round()
-    }
-
-    pub fn epoch(&self) -> u64 {
-        self.share.epoch()
-    }
-
-    pub fn verify(&self, rand_config: &RandConfig) -> anyhow::Result<()> {
-        self.share.verify(rand_config)
-    }
-
-    pub fn optimistic_verify(&self, rand_config: &RandConfig) -> anyhow::Result<()> {
-        self.share.optimistic_verify(rand_config)
-    }
-
-    pub fn share_id(&self) -> ShareId {
-        self.share.share_id()
     }
 }
 
@@ -601,15 +499,9 @@ impl<D: TAugmentedData> AugData<D> {
         &self.author
     }
 
-    pub fn verify(
-        &self,
-        rand_config: &RandConfig,
-        fast_rand_config: &Option<RandConfig>,
-        sender: Author,
-    ) -> anyhow::Result<()> {
+    pub fn verify(&self, rand_config: &RandConfig, sender: Author) -> anyhow::Result<()> {
         ensure!(self.author == sender, "Invalid author");
-        self.data
-            .verify(rand_config, fast_rand_config, &self.author)?;
+        self.data.verify(rand_config, &self.author)?;
         Ok(())
     }
 }
@@ -805,7 +697,9 @@ impl RandConfig {
         let player = Player {
             id: self.get_id(peer),
         };
-        self.wconfig.get_player_weight(&player) as u64
+        self.wconfig
+            .get_player_weight(&player)
+            .expect("peer's player id is in bounds") as u64
     }
 
     pub fn threshold(&self) -> u64 {
@@ -1071,7 +965,9 @@ mod tests {
         let share = Share::generate(&ctx.rand_configs[0], metadata);
 
         // optimistic_verify should succeed (deferred verification)
-        assert!(share.optimistic_verify(&ctx.rand_configs[0]).is_ok());
+        assert!(share
+            .optimistic_verify(&ctx.rand_configs[0], share.author())
+            .is_ok());
     }
 
     #[test]
@@ -1088,7 +984,9 @@ mod tests {
         let share = RandShare::new(bad_author, metadata, wrong_share.share().clone());
 
         // optimistic_verify should fail (falls through to individual verification)
-        assert!(share.optimistic_verify(&ctx.rand_configs[0]).is_err());
+        assert!(share
+            .optimistic_verify(&ctx.rand_configs[0], &bad_author)
+            .is_err());
     }
 
     #[test]
@@ -1101,7 +999,9 @@ mod tests {
         let share = RandShare::new(ctx.authors[0], metadata, wrong_share.share().clone());
 
         // With optimization disabled, every share is verified individually
-        assert!(share.optimistic_verify(&ctx.rand_configs[0]).is_err());
+        assert!(share
+            .optimistic_verify(&ctx.rand_configs[0], share.author())
+            .is_err());
     }
 
     #[test]
@@ -1207,5 +1107,55 @@ mod tests {
             bad_authors.is_empty(),
             "Non-optimistic mode skips pre_aggregate_verify"
         );
+    }
+
+    /// Test that the key pair DB format change is backward compatible.
+    /// Old format: (AugKeyPair, Option<AugKeyPair>) where AugKeyPair = (ASK, APK)
+    /// New format: AugKeyPair = (ASK, APK)
+    /// The deserialization logic in epoch_manager.rs tries old format first,
+    /// Key pairs are stored as (AugKeyPair, Option<AugKeyPair>) for backward compatibility.
+    /// The second element was the fast path key pair, now always None.
+    #[test]
+    fn test_key_pair_serialization_backward_compat() {
+        use aptos_types::randomness::{APK, ASK};
+
+        let ctx = MultiValidatorTestContext::new(vec![1, 1, 1, 1], false);
+        let keys = &ctx.rand_configs[0].keys;
+        let ask = keys.ask.clone();
+        let apk = keys.apk.clone();
+
+        type AugKeyPair = (ASK, APK);
+
+        let key_pair: AugKeyPair = (ask.clone(), apk.clone());
+
+        // Old data with fast=Some (written before fast path removal)
+        let old_bytes_with_fast =
+            bcs::to_bytes(&(key_pair.clone(), Some(key_pair.clone()))).unwrap();
+        // New data with fast=None (written after fast path removal)
+        let new_bytes = bcs::to_bytes(&(key_pair.clone(), None::<AugKeyPair>)).unwrap();
+
+        // Old format with fast=Some should deserialize, extracting the main key pair
+        let (main, _fast): (AugKeyPair, Option<AugKeyPair>) =
+            bcs::from_bytes(&old_bytes_with_fast).unwrap();
+        assert_eq!(
+            bcs::to_bytes(&main.0).unwrap(),
+            bcs::to_bytes(&ask).unwrap()
+        );
+        assert_eq!(
+            bcs::to_bytes(&main.1).unwrap(),
+            bcs::to_bytes(&apk).unwrap()
+        );
+
+        // New format with fast=None should deserialize identically
+        let (main, fast): (AugKeyPair, Option<AugKeyPair>) = bcs::from_bytes(&new_bytes).unwrap();
+        assert_eq!(
+            bcs::to_bytes(&main.0).unwrap(),
+            bcs::to_bytes(&ask).unwrap()
+        );
+        assert_eq!(
+            bcs::to_bytes(&main.1).unwrap(),
+            bcs::to_bytes(&apk).unwrap()
+        );
+        assert!(fast.is_none());
     }
 }

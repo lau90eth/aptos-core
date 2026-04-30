@@ -3,6 +3,7 @@
 
 pub mod account_minter;
 pub mod local_account_generator;
+pub mod metrics;
 pub mod stats;
 pub mod submission_worker;
 pub mod transaction_executor;
@@ -12,6 +13,7 @@ use crate::emitter::{
     local_account_generator::{
         create_keyless_account_generator, create_private_key_account_generator,
     },
+    metrics::update_tps_gauges,
     stats::{DynamicStatsTracking, TxnStats},
     submission_worker::SubmissionWorker,
     transaction_executor::RestApiReliableTransactionSubmitter,
@@ -56,8 +58,8 @@ use tokio::{runtime::Handle, task::JoinHandle, time};
 const MAX_TXNS: u64 = 1_000_000_000;
 
 // TODO Transfer cost increases during Coin => FA migration, we can reduce back later.
-pub const EXPECTED_GAS_PER_TRANSFER: u64 = 50;
-pub const EXPECTED_GAS_PER_ACCOUNT_CREATE: u64 = 1100 + 20;
+pub const EXPECTED_GAS_PER_TRANSFER: u64 = 500;
+pub const EXPECTED_GAS_PER_ACCOUNT_CREATE: u64 = 11000 + 200;
 
 const MAX_RETRIES: usize = 12;
 
@@ -202,6 +204,8 @@ pub struct EmitJobRequest {
     epk_expiry_date_secs: Option<u64>,
 
     keyless_jwt: Option<String>,
+
+    encrypt_transactions: bool,
 }
 
 impl Default for EmitJobRequest {
@@ -237,6 +241,7 @@ impl Default for EmitJobRequest {
             proof_file_path: None,
             epk_expiry_date_secs: None,
             keyless_jwt: None,
+            encrypt_transactions: false,
         }
     }
 }
@@ -398,6 +403,11 @@ impl EmitJobRequest {
 
     pub fn skip_funding_accounts(mut self) -> Self {
         self.skip_funding_accounts = true;
+        self
+    }
+
+    pub fn encrypt_transactions(mut self, encrypt: bool) -> Self {
+        self.encrypt_transactions = encrypt;
         self
     }
 
@@ -699,11 +709,16 @@ impl EmitJob {
                     .map(|p| &p[cur_phase])
                     .unwrap_or(&default_stats);
             prev_stats = Some(stats);
+
+            // Update Prometheus TPS gauges
+            let rate = delta.rate();
+            update_tps_gauges(rate.committed, rate.submitted);
+
             info!(
                 "[{:?}s stat] phase {}: {}",
                 window.as_secs(),
                 cur_phase,
-                delta.rate()
+                rate
             );
         }
     }
@@ -754,6 +769,19 @@ impl TxnEmitter {
             num_accounts, num_accounts
         );
 
+        // Build init factory with its own independent (empty) encryption key
+        // so it never encrypts, regardless of what happens to the traffic factory.
+        let init_expiration_time =
+            (mode_params.txn_expiration_time_secs as f64 * req.init_expiration_multiplier) as u64;
+        let init_txn_factory = self
+            .txn_factory
+            .clone()
+            .without_encryption()
+            .with_max_gas_amount(req.get_init_max_gas_per_txn())
+            .with_gas_unit_price(req.get_init_gas_price())
+            .with_transaction_expiration_time(init_expiration_time);
+
+        // Build traffic factory (may encrypt)
         let txn_factory = self
             .txn_factory
             .clone()
@@ -761,13 +789,20 @@ impl TxnEmitter {
             .with_gas_unit_price(req.gas_price)
             .with_max_gas_amount(req.max_gas_per_txn);
 
-        let init_expiration_time =
-            (mode_params.txn_expiration_time_secs as f64 * req.init_expiration_multiplier) as u64;
-        let init_txn_factory = txn_factory
-            .clone()
-            .with_max_gas_amount(req.get_init_max_gas_per_txn())
-            .with_gas_unit_price(req.get_init_gas_price())
-            .with_transaction_expiration_time(init_expiration_time);
+        // Set the encryption key on the traffic factory upfront.
+        // init_txn_factory has its own independent Arc so it won't be affected.
+        let has_per_workload_encryption = req.transaction_mix_per_phase.iter().any(|phase| {
+            phase
+                .iter()
+                .any(|(tt, _)| matches!(tt, TransactionType::Encrypted { .. }))
+        });
+        let needs_encryption = req.encrypt_transactions || has_per_workload_encryption;
+        if needs_encryption {
+            let state = self.rest_cli.get_ledger_information().await?.into_inner();
+            txn_factory
+                .update_encryption_key_state(state.epoch, state.encryption_key.as_deref())?;
+        }
+
         let init_retries: usize =
             usize::try_from(init_expiration_time / req.init_retry_interval.as_secs()).unwrap();
         let account_generator = match req.account_type {
@@ -867,6 +902,49 @@ impl TxnEmitter {
         // Creating workers is slow with many workers (TODO check why)
         // so we create them all first, before starting them - so they start at the right time for
         // traffic pattern to be correct.
+        // Spawn a background task that polls for the encryption key periodically.
+        // This is faster than waiting for submit response headers, which can take
+        // a full worker loop cycle (~txn_expiration_time_secs) to propagate.
+        if needs_encryption {
+            let poll_client = self.rest_cli.clone();
+            let encryption_key_handle = txn_factory.encryption_key_handle();
+            let poll_stop = stop.clone();
+            tokio_handle.spawn(async move {
+                let mut poll_interval = time::interval(Duration::from_secs(5));
+                loop {
+                    poll_interval.tick().await;
+                    if poll_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if let Ok(resp) = poll_client.get_ledger_information().await {
+                        let state = resp.into_inner();
+                        let mut guard = encryption_key_handle.write().unwrap();
+                        if state.epoch > guard.epoch {
+                            let new_key = state.encryption_key.as_deref().map(bcs::from_bytes);
+                            match new_key {
+                                Some(Ok(key)) => {
+                                    guard.epoch = state.epoch;
+                                    guard.key = Some(key);
+                                    info!(
+                                        "Encryption key poller: rotated key for epoch {}",
+                                        state.epoch
+                                    );
+                                },
+                                None => {
+                                    guard.epoch = state.epoch;
+                                    guard.key = None;
+                                },
+                                Some(Err(_)) => {
+                                    // Key bytes present but deserialization failed;
+                                    // don't advance epoch so we retry next tick.
+                                },
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
         info!("Tx emitter creating workers");
         let mut submission_workers = Vec::with_capacity(num_accounts);
         let all_clients = Arc::new(req.rest_clients.clone());

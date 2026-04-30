@@ -103,17 +103,7 @@ else:
     BUILD_FLAG = "--release"
     BUILD_FOLDER = "target/release"
 
-if os.environ.get("PROD_DB_FLAGS"):
-    DB_CONFIG_FLAGS = ""
-else:
-    DB_CONFIG_FLAGS = "--enable-storage-sharding"
-
-if os.environ.get("DISABLE_FA_APT"):
-    FEATURE_FLAGS = ""
-    FA_MIGRATION_COMPLETE = False
-else:
-    FEATURE_FLAGS = "--enable-feature NEW_ACCOUNTS_DEFAULT_TO_FA_APT_STORE --enable-feature OPERATIONS_DEFAULT_TO_FA_APT_STORE"
-    FA_MIGRATION_COMPLETE = True
+FEATURE_FLAGS = ""
 
 if os.environ.get("ENABLE_PRUNER"):
     DB_PRUNER_FLAGS = "--enable-state-pruner --enable-ledger-pruner --enable-epoch-snapshot-pruner --ledger-pruning-batch-size 10000 --state-prune-window 3000000 --epoch-snapshot-prune-window 3000000 --ledger-prune-window 3000000"
@@ -122,6 +112,20 @@ else:
 
 HIDE_OUTPUT = os.environ.get("HIDE_OUTPUT")
 SKIP_MOVE_E2E = os.environ.get("SKIP_MOVE_E2E")
+
+# Executor types still under active development. Their results are reported
+# as warnings only -- never block CI -- so we can track perf trends without
+# letting noise on experimental code paths fail builds.
+NON_BLOCKING_EXECUTOR_TYPES = frozenset(
+    {
+        "NativeVM",
+        "NativeSpeculative",
+        "AptosVMSpeculative",
+        "NativeValueCacheSpeculative",
+        "NativeNoStorageSpeculative",
+        "sharded",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -294,7 +298,7 @@ TESTS = [
     RunGroupConfig(
         key=RunGroupKey(
             "no_commit_{}{}".format(
-                transaction_type:="apt-fa-transfer" if FA_MIGRATION_COMPLETE else "coin-transfer", 
+                transaction_type:="apt-fa-transfer", 
                 "_sharding" if executor_sharding else "",
             ),
             executor_type=executor_type
@@ -311,8 +315,9 @@ TESTS = [
     )
     for executor_sharding, executor_types in [
         (False, ["VM", "NativeVM", "AptosVMSpeculative", "NativeSpeculative"]),
-        # executor sharding doesn't support FA for now.
-        (True, [] if FA_MIGRATION_COMPLETE else ["VM", "NativeVM"])
+        # executor sharding doesn't support FA for now. 
+        # change to ["VM", "NativeVM"] once it does.
+        (True, [])
     ]
     for executor_type in executor_types
 ] + [
@@ -321,7 +326,7 @@ TESTS = [
         expected_tps=10000 if sequential else 30000,
         key=RunGroupKey(
             "{}_{}_by_stages".format(
-                transaction_type:="apt-fa-transfer" if FA_MIGRATION_COMPLETE else "coin-transfer", 
+                transaction_type:="apt-fa-transfer", 
                 "sequential" if sequential else "parallel"
             ), 
             executor_type=executor_type
@@ -340,7 +345,8 @@ TESTS = [
     for executor_sharding, executor_types in [
         (False, ["VM", "NativeVM", "AptosVMSpeculative", "NativeSpeculative", "NativeValueCacheSpeculative", "NativeNoStorageSpeculative"]),
         # executor sharding doesn't support FA for now.
-        (True, [] if FA_MIGRATION_COMPLETE else ["VM", "NativeVM"])
+        # change to ["VM", "NativeVM"] once it does.
+        (True, [])
     ]
     for executor_type in executor_types
 ]
@@ -682,7 +688,7 @@ with tempfile.TemporaryDirectory() as tmpdirname:
 
     execute_command(f"cargo build {BUILD_FLAG} --package aptos-executor-benchmark")
     print(f"Warmup - creating DB with {NUM_ACCOUNTS} accounts")
-    create_db_command = f"PUSH_METRICS_NAMESPACE=benchmark-create-db RUST_BACKTRACE=1 {BUILD_FOLDER}/aptos-executor-benchmark --block-executor-type aptos-vm-with-block-stm --block-size {MAX_BLOCK_SIZE} --execution-threads {NUMBER_OF_EXECUTION_THREADS} {DB_CONFIG_FLAGS} {DB_PRUNER_FLAGS} create-db {FEATURE_FLAGS} --data-dir {tmpdirname}/db --num-accounts {NUM_ACCOUNTS}"
+    create_db_command = f"PUSH_METRICS_NAMESPACE=benchmark-create-db RUST_BACKTRACE=1 {BUILD_FOLDER}/aptos-executor-benchmark --block-executor-type aptos-vm-with-block-stm --block-size {MAX_BLOCK_SIZE} --execution-threads {NUMBER_OF_EXECUTION_THREADS} {DB_PRUNER_FLAGS} create-db {FEATURE_FLAGS} --data-dir {tmpdirname}/db --num-accounts {NUM_ACCOUNTS}"
     output = execute_command(create_db_command)
 
     results = []
@@ -815,7 +821,7 @@ with tempfile.TemporaryDirectory() as tmpdirname:
         else:
             additional_dst_pool_accounts = 2 * MAX_BLOCK_SIZE * NUM_BLOCKS
 
-        common_command_suffix = f"{executor_type_str} {pipeline_extra_args_str} --block-size {cur_block_size} {DB_CONFIG_FLAGS} {DB_PRUNER_FLAGS} run-executor {FEATURE_FLAGS} {workload_args_str} --module-working-set-size {test.key.module_working_set_size} --main-signer-accounts {MAIN_SIGNER_ACCOUNTS} --additional-dst-pool-accounts {additional_dst_pool_accounts} --data-dir {tmpdirname}/db  --checkpoint-dir {tmpdirname}/cp"
+        common_command_suffix = f"{executor_type_str} {pipeline_extra_args_str} --block-size {cur_block_size} {DB_PRUNER_FLAGS} run-executor {FEATURE_FLAGS} {workload_args_str} --module-working-set-size {test.key.module_working_set_size} --main-signer-accounts {MAIN_SIGNER_ACCOUNTS} --additional-dst-pool-accounts {additional_dst_pool_accounts} --data-dir {tmpdirname}/db  --checkpoint-dir {tmpdirname}/cp"
 
         number_of_threads_results = {}
 
@@ -1027,9 +1033,14 @@ with tempfile.TemporaryDirectory() as tmpdirname:
             )
             print_table(results, by_levels=False, only_fields=[])
 
+        is_blocking = (
+            not test.waived
+            and test.key.executor_type not in NON_BLOCKING_EXECUTOR_TYPES
+        )
+
         if single_node_result.tps < criteria.min_tps:
             text = f"regression detected {single_node_result.tps}, expected median {criteria.expected_tps}, threshold: {criteria.min_tps}), {test.key} didn't meet TPS requirements"
-            if not test.waived:
+            if is_blocking:
                 errors.append(text)
             else:
                 warnings.append(text)
@@ -1041,7 +1052,7 @@ with tempfile.TemporaryDirectory() as tmpdirname:
             and single_node_result.tps > criteria.max_tps
         ):
             text = f"perf improvement detected {single_node_result.tps}, expected median {criteria.expected_tps}, threshold: {criteria.max_tps}), {test.key} exceeded TPS requirements, increase TPS requirements to match new baseline"
-            if not test.waived:
+            if is_blocking:
                 errors.append(text)
             else:
                 warnings.append(text)

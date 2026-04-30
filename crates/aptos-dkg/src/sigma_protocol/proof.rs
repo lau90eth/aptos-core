@@ -2,14 +2,14 @@
 // Licensed pursuant to the Innovation-Enabling Source Code License, available at https://github.com/aptos-labs/aptos-core/blob/main/LICENSE
 
 use crate::sigma_protocol::{homomorphism, Statement, Witness};
-use ark_ff::PrimeField;
+use ark_ff::Field;
 use ark_serialize::{
     CanonicalDeserialize, CanonicalSerialize, Compress, Read, SerializationError, Valid, Validate,
     Write,
 };
 
 #[derive(CanonicalSerialize, Debug, CanonicalDeserialize, Clone)]
-pub struct Proof<F: PrimeField, H: homomorphism::Trait>
+pub struct Proof<F: Field, H: homomorphism::Trait>
 where
     H::Domain: Witness<F>,
     H::CodomainNormalized: Statement,
@@ -22,12 +22,22 @@ where
     pub z: H::Domain,
 }
 
-impl<F: PrimeField, H: homomorphism::Trait> Proof<F, H>
+impl<F: Field, H: homomorphism::Trait> Proof<F, H>
 where
     H::Domain: Witness<F>,
     H::CodomainNormalized: Statement,
 {
-    /// No-op (semantically): circumvents the fact that proofs inherit the homomorphism’s lifetime. This method should do nothing at runtime.
+    /// Reference to the prover's first message (commitment) when the proof stores a commitment.
+    /// Returns `None` when the first proof item is the challenge (non-batchable proof). (Obviously
+    /// it can be recomputed in this setting)
+    pub fn prover_commitment(&self) -> Option<&H::CodomainNormalized> {
+        match &self.first_proof_item {
+            FirstProofItem::Commitment(a) => Some(a),
+            FirstProofItem::Challenge(_) => None,
+        }
+    }
+
+    /// No-op (semantically): circumvents the fact that proofs inherit the homomorphism's lifetime. This method should do nothing at runtime.
     #[allow(non_snake_case)]
     pub fn change_lifetime<H2>(self) -> Proof<F, H2>
     where
@@ -48,7 +58,7 @@ where
 // Manual implementation of PartialEq and Eq is required here because deriving PartialEq/Eq would
 // automatically require `H` itself to implement PartialEq and Eq, which is undesirable.
 // Workaround would be to make `Proof` generic over `H::Domain` and `H::Codomain` instead of `H`
-impl<F: PrimeField, H: homomorphism::Trait> PartialEq for Proof<F, H>
+impl<F: Field, H: homomorphism::Trait> PartialEq for Proof<F, H>
 where
     H::Domain: Witness<F>,
     H::CodomainNormalized: Statement,
@@ -59,7 +69,7 @@ where
 }
 
 // Empty because it simply asserts reflexivity
-impl<F: PrimeField, H: homomorphism::Trait> Eq for Proof<F, H>
+impl<F: Field, H: homomorphism::Trait> Eq for Proof<F, H>
 where
     H::Domain: Witness<F>,
     H::CodomainNormalized: Statement,
@@ -71,7 +81,7 @@ where
 /// - The second message of the protocol, which is the challenge from the verifier. This leads to a proof which is amenable to batch verification.
 /// TODO: Better name? In https://github.com/sigma-rs/sigma-proofs these would be called "compact" and "batchable" proofs
 #[derive(Clone, Debug, Eq)]
-pub enum FirstProofItem<F: PrimeField, H: homomorphism::Trait>
+pub enum FirstProofItem<F: Field, H: homomorphism::Trait>
 where
     H::CodomainNormalized: Statement,
 {
@@ -81,7 +91,7 @@ where
 
 // Manual implementation of PartialEq is required here because deriving PartialEq would
 // automatically require `H` itself to implement PartialEq, which is undesirable.
-impl<F: PrimeField, H: homomorphism::Trait> PartialEq for FirstProofItem<F, H>
+impl<F: Field, H: homomorphism::Trait> PartialEq for FirstProofItem<F, H>
 where
     H::CodomainNormalized: Statement,
 {
@@ -96,7 +106,7 @@ where
 
 // The natural CanonicalSerialize/Deserialize implementations for `FirstProofItem`; we follow the usual approach for enums.
 // CanonicalDeserialize needs Valid.
-impl<F: PrimeField, H: homomorphism::Trait> Valid for FirstProofItem<F, H>
+impl<F: Field, H: homomorphism::Trait> Valid for FirstProofItem<F, H>
 where
     H::Domain: Witness<F>,
     H::CodomainNormalized: Statement + Valid,
@@ -109,7 +119,7 @@ where
     }
 }
 
-impl<F: PrimeField, H: homomorphism::Trait> CanonicalSerialize for FirstProofItem<F, H>
+impl<F: Field, H: homomorphism::Trait> CanonicalSerialize for FirstProofItem<F, H>
 where
     H::Domain: Witness<F>,
     H::CodomainNormalized: Statement + CanonicalSerialize,
@@ -139,7 +149,7 @@ where
     }
 }
 
-impl<F: PrimeField, H: homomorphism::Trait> CanonicalDeserialize for FirstProofItem<F, H>
+impl<F: Field, H: homomorphism::Trait> CanonicalDeserialize for FirstProofItem<F, H>
 where
     H::Domain: Witness<F>,
     H::CodomainNormalized: Statement + CanonicalDeserialize + Valid,

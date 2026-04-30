@@ -1,6 +1,7 @@
-// Copyright (c) The Diem Core Contributors
-// Copyright (c) The Move Contributors
-// SPDX-License-Identifier: Apache-2.0
+// Parts of the file are Copyright (c) The Diem Core Contributors
+// Parts of the file are Copyright (c) The Move Contributors
+// Parts of the file are Copyright (c) Aptos Foundation
+// All Aptos Foundation code and content is licensed pursuant to the Innovation-Enabling Source Code License, available at https://github.com/aptos-labs/aptos-core/blob/main/LICENSE
 
 pub const TEST_DIR: &str = "tests";
 
@@ -93,16 +94,6 @@ const TEST_CONFIGS: &[TestConfig] = &[
         language_version: LanguageVersion::latest(),
         include: &[], // all tests except those excluded below
         exclude: COMMON_EXCLUSIONS,
-        cross_compile: false,
-    },
-    // Test `/operator_eval/` with language version 1 and 2
-    TestConfig {
-        name: "operator-eval-lang-1",
-        runner: |p| run(p, get_config_by_name("operator-eval-lang-1")),
-        experiments: &[(Experiment::OPTIMIZE, true)],
-        language_version: LanguageVersion::V1,
-        include: &["/operator_eval/"],
-        exclude: &["/structs_visibility/"],
         cross_compile: false,
     },
     TestConfig {
@@ -208,8 +199,6 @@ const SEPARATE_BASELINE: &[&str] = &[
     "no-v1-comparison/enum/enum_scoping.move",
     // Different error messages depending on optimizations or not
     "no-v1-comparison/fv_as_keys.move",
-    // needed until bug #17615 is fixed
-    "misc/bug_14817_extended.move",
     // run in verbose mode to unveil the exact error messages
     "/signed-int/",
     // different expected result

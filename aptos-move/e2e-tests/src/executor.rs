@@ -26,8 +26,7 @@ use aptos_gas_schedule::{
 use aptos_keygen::KeyGen;
 use aptos_rest_client::AptosBaseUrl;
 use aptos_transaction_simulation::{
-    DeltaStateStore, EitherStateView, EmptyStateView, SimulationStateStore,
-    GENESIS_CHANGE_SET_HEAD, GENESIS_CHANGE_SET_MAINNET, GENESIS_CHANGE_SET_TESTNET,
+    DeltaStateStore, EitherStateView, EmptyStateView, SimulationStateStore, GENESIS_CHANGE_SET_HEAD,
 };
 use aptos_types::{
     account_config::{
@@ -68,11 +67,11 @@ use aptos_vm::{
     block_executor::AptosVMBlockExecutorWrapper,
     data_cache::AsMoveResolver,
     gas::make_prod_gas_meter,
-    move_vm_ext::{AptosMoveResolver, MoveVmExt, SessionExt, SessionId},
+    move_vm_ext::{AptosMoveResolver, SessionExt, SessionId},
     AptosVM, VMValidator,
 };
 use aptos_vm_environment::environment::AptosEnvironment;
-use aptos_vm_genesis::{generate_genesis_change_set_for_testing_with_count, GenesisOptions};
+use aptos_vm_genesis::generate_genesis_change_set_for_testing_with_count;
 use aptos_vm_logging::log_schema::AdapterLogSchema;
 use aptos_vm_types::{
     module_and_script_storage::{module_storage::AptosModuleStorage, AsAptosCodeStorage},
@@ -91,6 +90,7 @@ use move_core_types::{
 use move_coverage::{coverage_map, coverage_map::CoverageMap};
 use move_vm_runtime::{
     module_traversal::{TraversalContext, TraversalStorage},
+    move_vm::SerializedReturnValues,
     tracing,
 };
 use move_vm_types::gas::UnmeteredGasMeter;
@@ -496,25 +496,8 @@ impl<O: OutputLogger> FakeExecutorImpl<O> {
     /// Creates an executor from the genesis file GENESIS_FILE_LOCATION
     pub fn from_head_genesis_with_count(count: u64) -> Self {
         Self::from_genesis(
-            generate_genesis_change_set_for_testing_with_count(GenesisOptions::Head, count)
-                .write_set(),
+            generate_genesis_change_set_for_testing_with_count(count).write_set(),
             ChainId::test(),
-        )
-    }
-
-    /// Creates an executor using the standard genesis.
-    pub fn from_testnet_genesis() -> Self {
-        Self::from_genesis(
-            GENESIS_CHANGE_SET_TESTNET.clone().write_set(),
-            ChainId::testnet(),
-        )
-    }
-
-    /// Creates an executor using the mainnet genesis.
-    pub fn from_mainnet_genesis() -> Self {
-        Self::from_genesis(
-            GENESIS_CHANGE_SET_MAINNET.clone().write_set(),
-            ChainId::mainnet(),
         )
     }
 
@@ -1051,6 +1034,7 @@ impl<O: OutputLogger> FakeExecutorImpl<O> {
                 discard_failed_blocks: false,
                 module_cache_config: BlockExecutorModuleCacheLocalConfig::default(),
                 enable_pre_write: true,
+                persist_hotness_in_epilogue: false,
             },
             onchain: onchain_config.clone(),
         };
@@ -1406,7 +1390,7 @@ impl<O: OutputLogger> FakeExecutorImpl<O> {
 
         let env = AptosEnvironment::new(&self.state_store);
         let resolver = self.state_store.as_move_resolver();
-        let vm = MoveVmExt::new(&env);
+        let vm = AptosVM::new(&env);
         let module_storage = self.state_store.as_aptos_code_storage(&env);
 
         let mut i = 0;
@@ -1447,7 +1431,7 @@ impl<O: OutputLogger> FakeExecutorImpl<O> {
                         env.gas_feature_version(),
                         env.gas_params().as_ref().unwrap().vm.clone(),
                         env.storage_gas_params().as_ref().unwrap().clone(),
-                        false,
+                        None,
                         1_000_000_000_000_000.into(),
                         &NoopBlockSynchronizationKillSwitch {},
                     )),
@@ -1545,7 +1529,7 @@ impl<O: OutputLogger> FakeExecutorImpl<O> {
                 }),
             );
             let resolver = self.state_store.as_move_resolver();
-            let vm = MoveVmExt::new(&env);
+            let vm = AptosVM::new(&env);
 
             let module_storage = self.state_store.as_aptos_code_storage(&env);
             let mut session = vm.new_session(&resolver, SessionId::void(), None);
@@ -1566,7 +1550,7 @@ impl<O: OutputLogger> FakeExecutorImpl<O> {
                         env.gas_feature_version(),
                         env.gas_params().as_ref().unwrap().vm.clone(),
                         env.storage_gas_params().as_ref().unwrap().clone(),
-                        false,
+                        None,
                         10_000_000_000_000,
                         &NoopBlockSynchronizationKillSwitch {},
                     ),
@@ -1608,7 +1592,7 @@ impl<O: OutputLogger> FakeExecutorImpl<O> {
         let (write_set, events) = {
             let env = AptosEnvironment::new(&self.state_store);
             let resolver = self.state_store.as_move_resolver();
-            let vm = MoveVmExt::new(&env);
+            let vm = AptosVM::new(&env);
 
             let module_storage = self.state_store.as_aptos_code_storage(&env);
             let mut session = vm.new_session(&resolver, SessionId::void(), None);
@@ -1654,7 +1638,7 @@ impl<O: OutputLogger> FakeExecutorImpl<O> {
     ) -> Result<(WriteSet, Vec<ContractEvent>), VMStatus> {
         let env = AptosEnvironment::new(&self.state_store);
         let resolver = self.state_store.as_move_resolver();
-        let vm = MoveVmExt::new(&env);
+        let vm = AptosVM::new(&env);
 
         let module_storage = self.state_store.as_aptos_code_storage(&env);
 
@@ -1677,6 +1661,58 @@ impl<O: OutputLogger> FakeExecutorImpl<O> {
             &module_storage,
             &ChangeSetConfigs::unlimited_at_gas_feature_version(env.gas_feature_version()),
         ))
+    }
+
+    /// Execute a Move function bypassing visibility checks and return the serialized return values.
+    /// This allows calling private functions from tests.
+    ///
+    /// # Arguments
+    /// * `module_address` - The address where the module is deployed (e.g., AccountAddress::from_hex_literal("0x7"))
+    /// * `module_name` - The module name (e.g., "confidential_asset")
+    /// * `function_name` - Function name to call
+    /// * `type_params` - Type parameters for the function
+    /// * `args` - BCS-serialized arguments
+    pub fn exec_with_return_values(
+        &mut self,
+        module_address: AccountAddress,
+        module_name: &str,
+        function_name: &str,
+        type_params: Vec<TypeTag>,
+        args: Vec<Vec<u8>>,
+    ) -> Result<SerializedReturnValues, VMStatus> {
+        let env = AptosEnvironment::new(&self.state_store);
+        let resolver = self.state_store.as_move_resolver();
+        let vm = AptosVM::new(&env);
+
+        let module_storage = self.state_store.as_aptos_code_storage(&env);
+
+        let mut session = vm.new_session(&resolver, SessionId::void(), None);
+        let traversal_storage = TraversalStorage::new();
+        let mut traversal_context = TraversalContext::new(&traversal_storage);
+
+        let module_id = ModuleId::new(module_address, Identifier::new(module_name).unwrap());
+
+        let return_values = session
+            .execute_function_bypass_visibility(
+                &module_id,
+                &Self::name(function_name),
+                type_params,
+                args,
+                &mut UnmeteredGasMeter,
+                &mut traversal_context,
+                &module_storage,
+            )
+            .map_err(|e| e.into_vm_status())?;
+
+        let (write_set, events) = finish_session_assert_no_modules(
+            session,
+            &module_storage,
+            &ChangeSetConfigs::unlimited_at_gas_feature_version(env.gas_feature_version()),
+        );
+        self.state_store.apply_write_set(&write_set).unwrap();
+        self.event_store.extend(events);
+
+        Ok(return_values)
     }
 
     pub fn execute_view_function(

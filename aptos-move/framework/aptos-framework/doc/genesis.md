@@ -44,7 +44,6 @@
 <b>use</b> <a href="consensus_config.md#0x1_consensus_config">0x1::consensus_config</a>;
 <b>use</b> <a href="create_signer.md#0x1_create_signer">0x1::create_signer</a>;
 <b>use</b> <a href="execution_config.md#0x1_execution_config">0x1::execution_config</a>;
-<b>use</b> <a href="../../aptos-stdlib/../move-stdlib/doc/features.md#0x1_features">0x1::features</a>;
 <b>use</b> <a href="../../aptos-stdlib/../move-stdlib/doc/fixed_point32.md#0x1_fixed_point32">0x1::fixed_point32</a>;
 <b>use</b> <a href="fungible_asset.md#0x1_fungible_asset">0x1::fungible_asset</a>;
 <b>use</b> <a href="gas_schedule.md#0x1_gas_schedule">0x1::gas_schedule</a>;
@@ -62,6 +61,7 @@
 <b>use</b> <a href="../../aptos-stdlib/../move-stdlib/doc/string.md#0x1_string">0x1::string</a>;
 <b>use</b> <a href="timestamp.md#0x1_timestamp">0x1::timestamp</a>;
 <b>use</b> <a href="transaction_fee.md#0x1_transaction_fee">0x1::transaction_fee</a>;
+<b>use</b> <a href="transaction_limits.md#0x1_transaction_limits">0x1::transaction_limits</a>;
 <b>use</b> <a href="transaction_validation.md#0x1_transaction_validation">0x1::transaction_validation</a>;
 <b>use</b> <a href="../../aptos-stdlib/../move-stdlib/doc/vector.md#0x1_vector">0x1::vector</a>;
 <b>use</b> <a href="version.md#0x1_version">0x1::version</a>;
@@ -336,7 +336,7 @@ Genesis step 1: Initialize aptos framework account and core modules on chain.
     // put reserved framework reserved accounts under aptos governance
     <b>let</b> framework_reserved_addresses = <a href="../../aptos-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>&lt;<b>address</b>&gt;[@0x2, @0x3, @0x4, @0x5, @0x6, @0x7, @0x8, @0x9, @0xa];
     <b>while</b> (!framework_reserved_addresses.is_empty()) {
-        <b>let</b> <b>address</b> = framework_reserved_addresses.pop_back&lt;<b>address</b>&gt;();
+        <b>let</b> <b>address</b> = framework_reserved_addresses.pop_back();
         <b>let</b> (_, framework_signer_cap) = <a href="account.md#0x1_account_create_framework_reserved_account">account::create_framework_reserved_account</a>(<b>address</b>);
         <a href="aptos_governance.md#0x1_aptos_governance_store_signer_cap">aptos_governance::store_signer_cap</a>(&aptos_framework_account, <b>address</b>, framework_signer_cap);
     };
@@ -368,6 +368,28 @@ Genesis step 1: Initialize aptos framework account and core modules on chain.
     <a href="block.md#0x1_block_initialize">block::initialize</a>(&aptos_framework_account, epoch_interval_microsecs);
     <a href="state_storage.md#0x1_state_storage_initialize">state_storage::initialize</a>(&aptos_framework_account);
     <a href="nonce_validation.md#0x1_nonce_validation_initialize">nonce_validation::initialize</a>(&aptos_framework_account);
+
+    <a href="transaction_limits.md#0x1_transaction_limits_initialize">transaction_limits::initialize</a>(
+        &aptos_framework_account,
+        // Execution tiers:
+        //   2x: 1M APT
+        //   4x: 5M APT
+        //   8x: 10M APT
+        <a href="../../aptos-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>[
+            <a href="transaction_limits.md#0x1_transaction_limits_new_tier">transaction_limits::new_tier</a>(1_000_000_0000_0000, 200),
+            <a href="transaction_limits.md#0x1_transaction_limits_new_tier">transaction_limits::new_tier</a>(5_000_000_0000_0000, 400),
+            <a href="transaction_limits.md#0x1_transaction_limits_new_tier">transaction_limits::new_tier</a>(10_000_000_0000_0000, 800),
+        ],
+        // IO tiers:
+        //   2x: 5M APT
+        //   4x: 10M APT
+        //   8x: 20M APT
+        <a href="../../aptos-stdlib/../move-stdlib/doc/vector.md#0x1_vector">vector</a>[
+            <a href="transaction_limits.md#0x1_transaction_limits_new_tier">transaction_limits::new_tier</a>(5_000_000_0000_0000, 200),
+            <a href="transaction_limits.md#0x1_transaction_limits_new_tier">transaction_limits::new_tier</a>(10_000_000_0000_0000, 400),
+            <a href="transaction_limits.md#0x1_transaction_limits_new_tier">transaction_limits::new_tier</a>(20_000_000_0000_0000, 800),
+        ],
+    );
 }
 </code></pre>
 

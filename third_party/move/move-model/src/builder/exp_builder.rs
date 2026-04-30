@@ -1,26 +1,31 @@
-// Copyright (c) The Diem Core Contributors
-// Copyright (c) The Move Contributors
-// SPDX-License-Identifier: Apache-2.0
+// Parts of the file are Copyright (c) The Diem Core Contributors
+// Parts of the file are Copyright (c) The Move Contributors
+// Parts of the file are Copyright (c) Aptos Foundation
+// All Aptos Foundation code and content is licensed pursuant to the Innovation-Enabling Source Code License, available at https://github.com/aptos-labs/aptos-core/blob/main/LICENSE
 
 use crate::{
     ast::{
         AbortKind, AccessSpecifier, AccessSpecifierKind, Address, AddressSpecifier, BehaviorKind,
-        BehaviorState, Exp, ExpData, LambdaCaptureKind, MatchArm, ModuleName, Operation, Pattern,
-        QualifiedSymbol, QuantKind, ResourceSpecifier, RewriteResult, Spec, TempIndex, Value,
+        Exp, ExpData, LambdaCaptureKind, MatchArm, MemoryLabel, MemoryRange, ModuleName, Operation,
+        Pattern, QualifiedSymbol, QuantKind, ResourceSpecifier, RewriteResult, Spec, TempIndex,
+        Value,
     },
     builder::{
         model_builder::{
-            AnyFunEntry, ConstEntry, EntryVisibility, LocalVarEntry, StructEntry, StructLayout,
+            AnyFunEntry, BuiltinReceiverType, ConstEntry, EntryVisibility, LocalVarEntry,
+            StructEntry, StructLayout,
         },
         module_builder::{ModuleBuilder, SpecBlockContext},
     },
+    exp_rewriter::ExpRewriterFunctions,
     metadata::{
         lang_feature_versions::{LANGUAGE_VERSION_FOR_RAC, LANGUAGE_VERSION_FOR_SINT},
         LanguageVersion,
     },
     model::{
-        FieldData, FieldId, FunctionKind, GlobalEnv, GlobalId, Loc, ModuleId, NodeId, Parameter,
-        QualifiedId, QualifiedInstId, SpecFunId, StructId, TypeParameter, TypeParameterKind,
+        FieldData, FieldId, FunId, FunctionKind, GlobalEnv, Loc, ModuleId, NodeId, Parameter,
+        QualifiedId, QualifiedInstId, SpecFunId, StructId, SurfaceSyntax, TypeParameter,
+        TypeParameterKind, UserId,
     },
     symbol::{Symbol, SymbolPool},
     ty::{
@@ -29,10 +34,9 @@ use crate::{
         TypeUnificationError, UnificationContext, Variance, WideningOrder, BOOL_TYPE,
     },
     well_known::{
-        BORROW_MUT_NAME, BORROW_NAME, UNSPECIFIED_ABORT_CODE, VECTOR_FUNCS_WITH_BYTECODE_INSTRS,
-        VECTOR_MODULE,
+        BORROW_GLOBAL, BORROW_GLOBAL_MUT, UNSPECIFIED_ABORT_CODE,
+        VECTOR_FUNCS_WITH_BYTECODE_INSTRS, VECTOR_MODULE,
     },
-    FunId,
 };
 use codespan_reporting::diagnostic::Severity;
 use itertools::Itertools;
@@ -45,6 +49,7 @@ use move_core_types::{
     ability::{Ability, AbilitySet},
     account_address::AccountAddress,
     function::ClosureMask,
+    language_storage::{BORROW, BORROW_MUT},
 };
 use move_ir_types::{
     location::{sp, Spanned},
@@ -73,6 +78,9 @@ pub(crate) struct ExpTranslator<'env, 'translator, 'module_translator> {
     pub local_table: LinkedList<BTreeMap<Symbol, LocalVarEntry>>,
     /// The name of the function this expression is associated with, if there is one.
     pub fun_name: Option<QualifiedSymbol>,
+    /// Context for tracking constant usage. When set, user of the constant
+    /// being translated will be recorded in it.
+    pub constant_use_context: Option<UserId>,
     /// Whether we are translating an inline function body.
     pub fun_is_inline: bool,
     /// The result type of the function this expression is associated with.
@@ -112,7 +120,7 @@ pub(crate) struct ExpTranslator<'env, 'translator, 'module_translator> {
     pub loop_stack: Vec<Option<PA::Label>>,
     /// Map from state label names to their GlobalId, ensuring the same label name
     /// always resolves to the same MemoryLabel across behavior predicates.
-    pub state_label_map: BTreeMap<Symbol, GlobalId>,
+    pub state_label_map: BTreeMap<Symbol, MemoryLabel>,
 }
 
 #[derive(Debug)]
@@ -168,6 +176,7 @@ impl<'env, 'translator, 'module_translator> ExpTranslator<'env, 'translator, 'mo
             fun_ptrs_table: BTreeMap::new(),
             local_table: LinkedList::new(),
             fun_name: None,
+            constant_use_context: None,
             fun_is_inline: false,
             result_type: None,
             lambda_result_type_stack: vec![],
@@ -238,6 +247,10 @@ impl<'env, 'translator, 'module_translator> ExpTranslator<'env, 'translator, 'mo
             .map(|e| e.kind == FunctionKind::Inline)
             .unwrap_or_default();
         self.fun_name = Some(name)
+    }
+
+    pub fn set_constant_use_context(&mut self, context: UserId) {
+        self.constant_use_context = Some(context)
     }
 
     pub fn set_result_type(&mut self, ty: Type) {
@@ -1248,11 +1261,16 @@ impl ExpTranslator<'_, '_, '_> {
                 }
             },
             EA::AccessSpecifierKind::Reads | EA::AccessSpecifierKind::Writes => {
-                self.check_language_version(
-                    &loc,
-                    "read/write access specifiers.",
-                    LANGUAGE_VERSION_FOR_RAC,
-                )?;
+                // Only gate on language version for function-level access specifiers
+                // (Impl mode). In spec blocks (Spec mode), reads/writes are allowed
+                // at language version 2.4 for access_of and spec function declarations.
+                if self.mode == ExpTranslationMode::Impl {
+                    self.check_language_version(
+                        &loc,
+                        "read/write access specifiers.",
+                        LANGUAGE_VERSION_FOR_RAC,
+                    )?;
+                }
             },
         }
         let resource = match (module_address, module_name, resource_name) {
@@ -2044,18 +2062,18 @@ impl ExpTranslator<'_, '_, '_> {
                 }
                 ExpData::Call(id, Operation::NoOp, vec![])
             },
-            EA::Exp_::Behavior(kind, pre_label, fn_name, type_args, sp!(_, args), post_label) => {
-                self.translate_behavior_predicate(
-                    &loc,
-                    *kind,
-                    pre_label,
-                    post_label,
-                    fn_name,
-                    type_args,
-                    args,
-                    expected_type,
-                    context,
-                )
+            EA::Exp_::Behavior(kind, target, sp!(_, args)) => {
+                self.translate_behavior_predicate(&loc, *kind, target, args, expected_type, context)
+            },
+            EA::Exp_::StateLabeled(pre_label, inner, post_label) => {
+                let inner_exp = self.translate_exp(inner, expected_type);
+                // Translate labels
+                let pre = pre_label.as_ref().map(|l| self.translate_state_label(l));
+                let post = post_label.as_ref().map(|l| self.translate_state_label(l));
+                let range = MemoryRange { pre, post };
+                // Propagate labels to leaf operations (Behavior, SpecFunction, Global, Exists)
+                self.propagate_state_labels(inner_exp.into_exp(), &range)
+                    .into()
             },
             EA::Exp_::UnresolvedError => {
                 // Error reported
@@ -2369,6 +2387,9 @@ impl ExpTranslator<'_, '_, '_> {
         } else {
             // Error reported
         }
+        // Record that this call originated from receiver-style syntax.
+        self.env()
+            .set_surface_syntax(id, SurfaceSyntax::ReceiverCall);
         // Construct result
         RewriteResult::RewrittenAndDescend(
             ExpData::Call(
@@ -2386,7 +2407,11 @@ impl ExpTranslator<'_, '_, '_> {
         result_exp.visit_pre_order(&mut |e| {
             if let ExpData::Call(id, Operation::Borrow(ReferenceKind::Mutable), args) = &e {
                 debug_assert!(args.len() == 1);
-                if let ExpData::Call(_, Operation::Select(_, _, _), ref_targets) = args[0].as_ref()
+                if let ExpData::Call(
+                    _,
+                    Operation::Select(_, _, _) | Operation::SelectVariants(_, _, _),
+                    ref_targets,
+                ) = args[0].as_ref()
                 {
                     debug_assert!(ref_targets.len() == 1);
                     if self
@@ -2894,6 +2919,68 @@ impl ExpTranslator<'_, '_, '_> {
                     false,
                     context,
                 )
+            },
+            EA::LValue_::Literal(val) => {
+                // Translate literal value pattern (for primitive pattern matching).
+                // Strip reference from expected type so `translate_value` sees the
+                // base type (e.g. `u64` instead of `&u64`), then assign the pattern
+                // node the original (possibly reference) type for AST consistency.
+                let inner_expected = expected_type.skip_reference();
+                if let Some((value, ty)) = self.translate_value(val, inner_expected, context) {
+                    let ty = self.check_type(loc, &ty, inner_expected, context);
+                    let pat_ty = if let Type::Reference(kind, _) = expected_type {
+                        Type::Reference(*kind, Box::new(ty))
+                    } else {
+                        ty
+                    };
+                    let id = self.new_node_id_with_type_loc(&pat_ty, loc);
+                    Pattern::LiteralValue(id, value)
+                } else {
+                    self.new_error_pat(loc)
+                }
+            },
+            EA::LValue_::Range(lo_val, hi_val, inclusive) => {
+                // Translate range pattern. Strip reference from expected type.
+                let inner_expected = expected_type.skip_reference();
+                // Range patterns only allowed on concrete integer types.
+                // Reject PrimitiveType::Num (unresolved spec numeric supertype)
+                // because get_min_value/get_max_value return None for it,
+                // which would silently disable range bound validation.
+                if matches!(inner_expected, Type::Primitive(PrimitiveType::Num)) {
+                    self.error(loc, "range patterns require a concrete integer type");
+                    return self.new_error_pat(loc);
+                }
+                if !inner_expected.is_number() {
+                    self.error(
+                        loc,
+                        &format!(
+                            "range patterns are only allowed on integer types, found `{}`",
+                            inner_expected.display(&self.type_display_context())
+                        ),
+                    );
+                    return self.new_error_pat(loc);
+                }
+                let lo = lo_val
+                    .as_ref()
+                    .map(|v| self.translate_value(v, inner_expected, context));
+                let hi = hi_val
+                    .as_ref()
+                    .map(|v| self.translate_value(v, inner_expected, context));
+                // Check if any bound translation failed.
+                if lo.as_ref().is_some_and(|r| r.is_none())
+                    || hi.as_ref().is_some_and(|r| r.is_none())
+                {
+                    return self.new_error_pat(loc);
+                }
+                let lo_value = lo.and_then(|r| r.map(|(v, _)| v));
+                let hi_value = hi.and_then(|r| r.map(|(v, _)| v));
+                let pat_ty = if expected_type.is_reference() {
+                    expected_type.clone()
+                } else {
+                    inner_expected.clone()
+                };
+                let id = self.new_node_id_with_type_loc(&pat_ty, loc);
+                Pattern::Range(id, lo_value, hi_value, *inclusive)
             },
         }
     }
@@ -3784,6 +3871,15 @@ impl ExpTranslator<'_, '_, '_> {
                     expected_type,
                     context,
                 ) {
+                    if type_args.as_ref().is_some_and(|args| !args.is_empty()) {
+                        self.error(
+                            loc,
+                            &format!(
+                                "type arguments cannot be provided for local variable `{}`",
+                                name.value.as_str()
+                            ),
+                        );
+                    }
                     return exp;
                 }
 
@@ -4006,10 +4102,31 @@ impl ExpTranslator<'_, '_, '_> {
             );
             self.new_error_exp()
         } else {
+            // Record constant usage.
+            // Why tracking constants on the fly:
+            // - they are replaced by values after translation!
+            if let Some(user_id) = &self.constant_use_context {
+                self.track_constant_usage(loc, sym, user_id.clone());
+            }
             let ConstEntry { ty, value, .. } = entry;
             let ty = self.check_type(loc, &ty, expected_type, context);
             let id = self.new_node_id_with_type_loc(&ty, loc);
             ExpData::Value(id, value)
+        }
+    }
+
+    fn track_constant_usage(&mut self, loc: &Loc, const_sym: &QualifiedSymbol, user_id: UserId) {
+        if let Some(const_entry) = self.parent.parent.const_table.get_mut(const_sym) {
+            const_entry.users.insert(user_id);
+        } else {
+            self.parent.parent.env.diag(
+                Severity::Bug,
+                loc,
+                &format!(
+                    "constant `{}` not found in const_table while tracking usage",
+                    const_sym.display(self.parent.parent.env)
+                ),
+            );
         }
     }
 
@@ -4071,11 +4188,11 @@ impl ExpTranslator<'_, '_, '_> {
         let type_opt = convert_name_to_type(&resource_ty_exp.loc, resource_ty_exp.clone().value);
         if let Some(ty) = type_opt {
             let name = if mutable {
-                self.symbol_pool().make("borrow_global_mut")
+                self.symbol_pool().make(BORROW_GLOBAL_MUT)
             } else {
-                self.symbol_pool().make("borrow_global")
+                self.symbol_pool().make(BORROW_GLOBAL)
             };
-            self.translate_call(
+            let result = self.translate_call(
                 loc,
                 &self.to_loc(&resource_ty_exp.loc),
                 CallKind::Regular,
@@ -4085,7 +4202,18 @@ impl ExpTranslator<'_, '_, '_> {
                 &[addr_exp],
                 expected_type,
                 context,
-            )
+            );
+            // translate_call may wrap the result in a Freeze node when the
+            // expected type is an immutable reference. Set the surface syntax
+            // on the inner node so it is attached to the actual operation.
+            let target_id = if let ExpData::Call(_, Operation::Freeze(_), args) = &result {
+                args[0].node_id()
+            } else {
+                result.node_id()
+            };
+            self.env()
+                .set_surface_syntax(target_id, SurfaceSyntax::IndexNotation);
+            result
         } else {
             self.new_error_exp()
         }
@@ -4158,6 +4286,8 @@ impl ExpTranslator<'_, '_, '_> {
         );
         self.set_node_instantiation(node_id, vec![inner_ty.clone()]);
         if let (Some(mid), Some(fid)) = self.get_vector_borrow(mutable) {
+            self.env()
+                .set_surface_syntax(node_id, SurfaceSyntax::IndexNotation);
             let call = ExpData::Call(node_id, Operation::MoveFunction(mid, fid), vec![
                 vec_exp_e.into_exp(),
                 idx_exp_e.clone().into_exp(),
@@ -4165,20 +4295,19 @@ impl ExpTranslator<'_, '_, '_> {
             return call;
         } else {
             // To use index notation in vector module
-            let borrow_fun_name = if mutable {
-                BORROW_MUT_NAME
-            } else {
-                BORROW_NAME
-            };
+            let borrow_fun_name = if mutable { BORROW_MUT } else { BORROW };
             if let Some(borrow_symbol) = self
                 .parent
                 .parent
-                .vector_receiver_functions
-                .get(&self.env().symbol_pool.make(borrow_fun_name))
+                .builtin_receiver_functions
+                .get(&BuiltinReceiverType::Vector)
+                .and_then(|fns| fns.get(&self.env().symbol_pool.make(borrow_fun_name)))
             {
                 if let Some(borrow_fun_entry) = self.parent.parent.fun_table.get(borrow_symbol) {
                     let mid = borrow_fun_entry.module_id;
                     let fid = borrow_fun_entry.fun_id;
+                    self.env()
+                        .set_surface_syntax(node_id, SurfaceSyntax::IndexNotation);
                     return ExpData::Call(node_id, Operation::MoveFunction(mid, fid), vec![
                         vec_exp_e.into_exp(),
                         idx_exp_e.clone().into_exp(),
@@ -4235,10 +4364,6 @@ impl ExpTranslator<'_, '_, '_> {
                 .parent
                 .spec_schema_table
                 .contains_key(&global_var_sym)
-                && self
-                    .env()
-                    .language_version
-                    .is_at_least(LanguageVersion::V2_0)
             {
                 self.error(loc, "indexing can only be applied to a vector or a resource type (a struct type which has key ability)");
                 call = Some(self.new_error_exp());
@@ -4340,6 +4465,64 @@ impl ExpTranslator<'_, '_, '_> {
             EA::ExpDotted_::Dot(e, n) => {
                 let loc = self.to_loc(&dotted.loc);
                 let field_name = self.symbol_pool().make(n.value.as_str());
+
+                // Check for variant-qualified field access: expr.Variant.field
+                // where `e` is `Dot(base, Variant)` and `Variant` is an enum variant name.
+                if let EA::ExpDotted_::Dot(base, variant_n) = &e.value {
+                    let variant_sym = self.symbol_pool().make(variant_n.value.as_str());
+                    // Translate base with unconstrained type to discover its type
+                    let base_ty = self.fresh_type_var();
+                    let base_exp = self.translate_dotted(
+                        base.as_ref(),
+                        &base_ty,
+                        index_mutate,
+                        &ErrorMessageContext::General,
+                    );
+                    let base_ty_spec = self.subs.specialize(&base_ty);
+                    let base_struct_ty = base_ty_spec.skip_reference();
+                    if let Type::Struct(mid, sid, inst) = base_struct_ty.clone() {
+                        let qid = mid.qualified_inst(sid, inst);
+                        if self
+                            .parent
+                            .parent
+                            .is_variant_name(&qid.to_qualified_id(), variant_sym)
+                        {
+                            // Name is a variant — look up the field in this variant
+                            if let Some((fid, field_ty)) = self
+                                .parent
+                                .parent
+                                .lookup_variant_field_decl(&qid, variant_sym, field_name)
+                            {
+                                let result_ty =
+                                    self.check_type(&loc, &field_ty, expected_type, context);
+                                let id = self.new_node_id_with_type_loc(&result_ty, &loc);
+                                self.set_node_instantiation(id, vec![base_ty_spec]);
+                                return ExpData::Call(
+                                    id,
+                                    Operation::SelectVariants(mid, sid, vec![fid]),
+                                    vec![base_exp.into_exp()],
+                                );
+                            }
+                            // Variant exists but field doesn't
+                            self.error(
+                                &loc,
+                                &format!(
+                                    "field `{}` not found in variant `{}` of `{}`",
+                                    field_name.display(self.symbol_pool()),
+                                    variant_sym.display(self.symbol_pool()),
+                                    base_ty_spec.display(&self.type_display_context()),
+                                ),
+                            );
+                            return self.new_error_exp();
+                        }
+                        // Not a variant name — fall through to normal field access
+                    }
+                    // Base type not resolved or not an enum with this variant —
+                    // fall through to normal processing (re-translates inner expression
+                    // with proper field constraints).
+                }
+
+                // Normal field access
                 let constraint = Constraint::SomeStruct(
                     [(field_name, expected_type.clone())].into_iter().collect(),
                 );
@@ -4446,11 +4629,12 @@ impl ExpTranslator<'_, '_, '_> {
                     .parent
                     .parent
                     .lookup_struct_field_decl(&mid.qualified_inst(sid, inst), field_name);
-                let expected_field_type = if let Some((_, ty)) = field_decls.into_iter().next() {
-                    ty
-                } else {
-                    Type::Error // this error is reported via type unification
-                };
+                let (variant, expected_field_type) =
+                    if let Some((variant, ty)) = field_decls.into_iter().next() {
+                        (variant, ty)
+                    } else {
+                        (None, Type::Error) // this error is reported via type unification
+                    };
                 let constraint = Constraint::SomeStruct(
                     [(field_name, expected_field_type.clone())]
                         .into_iter()
@@ -4472,11 +4656,20 @@ impl ExpTranslator<'_, '_, '_> {
                 let value_exp = self.translate_exp(args[2], &expected_field_type);
                 let id = self.new_node_id_with_type_loc(expected_type, loc);
                 self.set_node_instantiation(id, vec![expected_type.clone()]);
-                ExpData::Call(
-                    id,
-                    Operation::UpdateField(mid, sid, FieldId::new(field_name)),
-                    vec![struct_exp.into_exp(), value_exp.into_exp()],
-                )
+                // For enum types, use variant-qualified FieldId (like Select does)
+                let field_id = if let Some(v) = variant {
+                    let pool = self.symbol_pool();
+                    FieldId::new(pool.make(&FieldId::make_variant_field_id_str(
+                        pool.string(v).as_str(),
+                        pool.string(field_name).as_str(),
+                    )))
+                } else {
+                    FieldId::new(field_name)
+                };
+                ExpData::Call(id, Operation::UpdateField(mid, sid, field_id), vec![
+                    struct_exp.into_exp(),
+                    value_exp.into_exp(),
+                ])
             } else {
                 // Error reported
                 self.new_error_exp()
@@ -4857,7 +5050,7 @@ impl ExpTranslator<'_, '_, '_> {
                     other => other,
                 };
 
-                if let Operation::SpecFunction(module_id, spec_fun_id, None) = oper {
+                if let Operation::SpecFunction(module_id, spec_fun_id, _) = oper {
                     // Record the usage of spec function in specs, used later
                     // in spec translator.
                     self.parent
@@ -5682,6 +5875,7 @@ impl ExpTranslator<'_, '_, '_> {
             let (exp_ty, rdomain_exp) = self.translate_exp_free(domain_exp);
             let elem_ty = self.fresh_type_var();
             let exp_ty = self.subs.specialize(&exp_ty);
+            let is_state_domain = matches!(&exp_ty, Type::StateDomain);
             match &exp_ty {
                 Type::Vector(..) => {
                     self.check_type(
@@ -5707,8 +5901,18 @@ impl ExpTranslator<'_, '_, '_> {
                         &ErrorMessageContext::General,
                     );
                 },
+                Type::StateDomain => {
+                    // State domain: variable is a state label, not a normal local.
+                    // Unify elem_ty with StateDomain so the pattern has a concrete type.
+                    self.check_type(
+                        &loc,
+                        &elem_ty,
+                        &Type::StateDomain,
+                        &ErrorMessageContext::General,
+                    );
+                },
                 _ => {
-                    self.error(&loc, "quantified variables must range over a vector, a type domain, or a number range");
+                    self.error(&loc, "quantified variables must range over a vector, a type domain, a number range, or a state domain");
                     return self.new_error_exp();
                 },
             }
@@ -5720,7 +5924,11 @@ impl ExpTranslator<'_, '_, '_> {
                 false, /*allow_wildcard_for_tuple*/
                 &ErrorMessageContext::Binding,
             );
-            self.define_locals_of_pat(&rpat);
+            if !is_state_domain {
+                // State domain variables are not added to the local scope;
+                // they are resolved as state labels in |~ expressions.
+                self.define_locals_of_pat(&rpat);
+            }
             rranges.push((rpat, rdomain_exp.into_exp()));
         }
         let rtriggers = triggers
@@ -5736,6 +5944,8 @@ impl ExpTranslator<'_, '_, '_> {
         let rcondition = condition
             .as_ref()
             .map(|cond| self.translate_exp(cond, &BOOL_TYPE).into_exp());
+        // Validate that state-domain quantified variables are used as state labels in the body.
+        self.validate_state_domain_usage(&rranges, &rbody);
         self.exit_scope();
         let quant_ty = if rkind.is_choice() {
             self.env().get_node_type(rranges[0].0.node_id())
@@ -5747,15 +5957,62 @@ impl ExpTranslator<'_, '_, '_> {
         ExpData::Quant(id, rkind, rranges, rtriggers, rcondition, rbody.into_exp())
     }
 
-    /// Translates a behavior predicate expression (requires_of, aborts_of, ensures_of, modifies_of).
+    /// Validates that each state-domain quantifier variable is used as a state label
+    /// (`|~`) somewhere in the body of the quantifier.
+    fn validate_state_domain_usage(&self, rranges: &[(Pattern, Exp)], body: &ExpData) {
+        use std::collections::BTreeSet;
+        // Collect symbol names of state-domain quantifier variables
+        let mut state_domain_vars: Vec<(Symbol, Loc)> = Vec::new();
+        for (pat, range) in rranges.iter() {
+            let range_ty = self.env().get_node_type(range.node_id());
+            if matches!(range_ty, Type::StateDomain) {
+                if let Pattern::Var(id, sym) = pat {
+                    let loc = self.env().get_node_loc(*id);
+                    state_domain_vars.push((*sym, loc));
+                }
+            }
+        }
+        if state_domain_vars.is_empty() {
+            return;
+        }
+        // Collect all MemoryLabel values used in the body
+        let mut used_labels = BTreeSet::new();
+        body.visit_pre_order(&mut |e| {
+            if let ExpData::Call(_, op, _) = e {
+                for label in op.memory_labels() {
+                    used_labels.insert(label);
+                }
+            }
+            true
+        });
+        // Map labels back to symbol names
+        let mut used_label_names = BTreeSet::new();
+        for label in &used_labels {
+            if let Some(name) = self.env().get_memory_label_name(*label) {
+                used_label_names.insert(name);
+            }
+        }
+        // Check that each state-domain variable is used as a state label
+        for (sym, loc) in &state_domain_vars {
+            if !used_label_names.contains(sym) {
+                self.error(
+                    loc,
+                    &format!(
+                        "unused quantified state label `{}`; \
+                         state domain variables must be used as state labels (`|~`) in the body",
+                        self.symbol_pool().string(*sym)
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Translates a behavior predicate expression (requires_of, aborts_of, ensures_of, result_of).
     fn translate_behavior_predicate(
         &mut self,
         loc: &Loc,
         kind: PA::BehaviorKind,
-        pre_label: &Option<PA::Label>,
-        post_label: &Option<PA::Label>,
-        fn_name: &EA::ModuleAccess,
-        type_args: &Option<Vec<EA::Type>>,
+        target: &EA::Exp,
         args: &[EA::Exp],
         expected_type: &Type,
         context: &ErrorMessageContext,
@@ -5765,27 +6022,42 @@ impl ExpTranslator<'_, '_, '_> {
             PA::BehaviorKind::RequiresOf => BehaviorKind::RequiresOf,
             PA::BehaviorKind::AbortsOf => BehaviorKind::AbortsOf,
             PA::BehaviorKind::EnsuresOf => BehaviorKind::EnsuresOf,
-            PA::BehaviorKind::ModifiesOf => BehaviorKind::ModifiesOf,
             PA::BehaviorKind::ResultOf => BehaviorKind::ResultOf,
         };
 
-        // Validate and translate state labels
-        let behavior_state =
-            self.translate_behavior_state_labels(loc, &model_kind, pre_label, post_label);
+        // Translate the target expression and validate it has function type
+        let fun_type_var = self.fresh_type_var();
+        let fun_exp_data = self.translate_exp(target, &fun_type_var);
+        let fun_exp = fun_exp_data.into_exp();
 
-        // Resolve the function name to a function expression (Closure or Temporary)
-        let Some((fun_exp, expected_arg_types)) =
-            self.resolve_behavior_target(loc, fn_name, type_args, &model_kind)
-        else {
+        // Extract function arg/result types. The type may be a concrete Type::Fun
+        // or a constrained type variable (SomeFunctionValue constraint from function
+        // name resolution).
+        let Some((arg_ty, result_ty)) = self.subs.get_fun_type(&fun_type_var) else {
+            let fun_type = self.subs.specialize(&fun_type_var);
+            // Suppress follow-up error when the target already produced an error
+            // (e.g. undeclared name leaves the type as an unresolved variable)
+            if !fun_type.is_error() && !matches!(fun_type, Type::Var(..)) {
+                self.error(
+                    loc,
+                    &format!(
+                        "behavior predicate target must have function type, found `{}`",
+                        fun_type.display(&self.type_display_context())
+                    ),
+                );
+            }
             return self.new_error_exp();
         };
+
+        // Compute expected argument types based on behavior kind and function signature
+        let expected_arg_types = self.compute_behavior_arg_types(&arg_ty, &result_ty, &model_kind);
 
         // Translate arguments and check types
         let translated_args =
             self.translate_and_check_behavior_args(loc, args, &expected_arg_types, &model_kind);
 
         // Determine the result type based on the behavior kind
-        let fun_type = self.env().get_node_type(fun_exp.node_id());
+        let fun_type = Type::Fun(Box::new(arg_ty), Box::new(result_ty), AbilitySet::EMPTY);
         let Some(computed_result_ty) =
             self.compute_behavior_result_type(loc, &model_kind, &fun_type)
         else {
@@ -5800,188 +6072,197 @@ impl ExpTranslator<'_, '_, '_> {
 
         ExpData::Call(
             id,
-            Operation::Behavior(model_kind, behavior_state),
+            Operation::Behavior(model_kind, MemoryRange::default()),
             all_args,
         )
     }
 
-    /// Validates and translates state labels for behavior predicates.
-    /// Returns a BehaviorState with the translated memory labels. Names are registered
-    /// in GlobalEnv for lookup during printing.
-    fn translate_behavior_state_labels(
-        &mut self,
-        loc: &Loc,
-        kind: &BehaviorKind,
-        pre_label: &Option<PA::Label>,
-        post_label: &Option<PA::Label>,
-    ) -> BehaviorState {
-        // Validate label usage based on behavior kind
-        // Only ensures_of and result_of can have both pre and post labels
-        // Other predicates (requires_of, aborts_of, modifies_of) should not have post labels
-        if !matches!(kind, BehaviorKind::EnsuresOf | BehaviorKind::ResultOf) && post_label.is_some()
-        {
-            self.error(
-                loc,
-                &format!(
-                    "only ensures_of and result_of can have a post-state label (@post), not {}",
-                    kind
-                ),
-            );
-        }
-
-        // Convert labels to memory labels and register names with GlobalEnv
-        let pre_name = pre_label
-            .as_ref()
-            .map(|l| self.symbol_pool().make(l.value().as_str()));
-        let post_name = post_label
-            .as_ref()
-            .map(|l| self.symbol_pool().make(l.value().as_str()));
-        let mut get_or_create_label = |sym: Symbol| -> GlobalId {
-            if let Some(&id) = self.state_label_map.get(&sym) {
-                id
-            } else {
-                let id = self.env().new_global_id();
-                self.state_label_map.insert(sym, id);
-                self.env().set_memory_label_name(id, sym);
-                id
-            }
-        };
-        let pre = pre_name.map(&mut get_or_create_label);
-        let post = post_name.map(&mut get_or_create_label);
-        BehaviorState::new(pre, post)
-    }
-
-    /// Resolves the target of a behavior predicate to either a local variable or a function.
-    /// Returns a function expression (Temporary for locals, Closure for functions) and
-    /// the expected argument types.
-    fn resolve_behavior_target(
-        &mut self,
-        loc: &Loc,
-        maccess: &EA::ModuleAccess,
-        type_args: &Option<Vec<EA::Type>>,
-        kind: &BehaviorKind,
-    ) -> Option<(Exp, Vec<Type>)> {
-        match &maccess.value {
-            EA::ModuleAccess_::Name(name) => {
-                // First try to resolve as a local variable/parameter
-                let sym = self.symbol_pool().make(name.value.as_str());
-                // Extract data from entry first to avoid borrow conflicts
-                let local_info = self
-                    .lookup_local(sym, false)
-                    .map(|entry| (entry.type_.clone(), entry.temp_index));
-                if let Some((entry_type, temp_index)) = local_info {
-                    // Check if it's a function type
-                    let ty = self.subs.specialize(&entry_type);
-                    if let Type::Fun(arg_ty, result_ty, _abilities) = &ty {
-                        // Check that no type arguments are provided for function parameters
-                        if type_args.as_ref().is_some_and(|args| !args.is_empty()) {
-                            self.error(
-                                loc,
-                                &format!(
-                                    "type arguments cannot be provided for function parameter `{}`",
-                                    sym.display(self.symbol_pool())
-                                ),
-                            );
-                            return None;
-                        }
-                        let expected_types =
-                            self.compute_behavior_arg_types(arg_ty, result_ty, kind);
-                        let id = self.new_node_id_with_type_loc(&ty, loc);
-                        let fun_exp = if let Some(temp_idx) = temp_index {
-                            // For function parameters with temp_index, use Temporary
-                            ExpData::Temporary(id, temp_idx).into_exp()
-                        } else {
-                            // For spec function parameters (no temp_index), use LocalVar
-                            ExpData::LocalVar(id, sym).into_exp()
-                        };
-                        return Some((fun_exp, expected_types));
-                    } else {
-                        self.error(
-                            loc,
-                            &format!(
-                                "behavior predicate target `{}` must have function type, found `{}`",
-                                sym.display(self.symbol_pool()),
-                                ty.display(&self.type_display_context())
-                            ),
-                        );
-                        return None;
-                    }
-                }
-                // Fall through to try resolving as a function
-                let global_sym = self.parent.qualified_by_module(sym);
-                self.resolve_function_target(loc, &global_sym, type_args, kind)
-            },
-            EA::ModuleAccess_::ModuleAccess(..) => {
-                let global_sym = self.parent.module_access_to_qualified(maccess);
-                self.resolve_function_target(loc, &global_sym, type_args, kind)
-            },
-        }
-    }
-
-    /// Resolves a qualified function name for behavior predicates.
-    /// Returns a Closure expression for the function and the expected argument types.
-    fn resolve_function_target(
-        &mut self,
-        loc: &Loc,
-        global_sym: &QualifiedSymbol,
-        type_args: &Option<Vec<EA::Type>>,
-        kind: &BehaviorKind,
-    ) -> Option<(Exp, Vec<Type>)> {
-        if let Some(entry) = self.parent.parent.fun_table.get(global_sym) {
-            let module_id = entry.module_id;
-            let fun_id = entry.fun_id;
-            let type_params = entry.type_params.clone();
-            let params = entry.params.clone();
-            let result_type = entry.result_type.clone();
-
-            // Make instantiation
-            let instantiation = self.make_instantiation_or_report(
-                loc,
-                false,
-                global_sym.symbol,
-                &type_params,
-                type_args,
-            )?;
-
-            // Compute instantiated parameter types
-            let param_types: Vec<Type> = params
-                .iter()
-                .map(|p| p.get_type().instantiate(&instantiation))
-                .collect();
-            let instantiated_result_type = result_type.instantiate(&instantiation);
-
-            // Compute expected argument types based on behavior kind
-            let arg_ty = Type::tuple(param_types.clone());
-            let expected_types =
-                self.compute_behavior_arg_types(&arg_ty, &instantiated_result_type, kind);
-
-            // Create a function type for the closure
-            let fun_type = Type::Fun(
-                Box::new(Type::tuple(param_types)),
-                Box::new(instantiated_result_type),
-                AbilitySet::EMPTY,
-            );
-
-            // Create a Closure expression
-            let id = self.new_node_id_with_type_loc(&fun_type, loc);
-            self.set_node_instantiation(id, instantiation);
-            let fun_exp = ExpData::Call(
-                id,
-                Operation::Closure(module_id, fun_id, ClosureMask::empty()),
-                vec![],
-            )
-            .into_exp();
-            Some((fun_exp, expected_types))
+    /// Translates a single state label to a MemoryLabel (GlobalId), reusing existing labels
+    /// if the same name was already used. Uses the parent `ModuleBuilder`'s shared
+    /// `spec_block_state_labels` map so that the same label name across different conditions
+    /// in the same spec block resolves to the same MemoryLabel.
+    fn translate_state_label(&mut self, label: &PA::Label) -> MemoryLabel {
+        let sym = self.symbol_pool().make(label.value().as_str());
+        // Check the spec-block-level shared map first
+        if let Some(&id) = self.parent.spec_block_state_labels.get(&sym) {
+            // Also cache in the local map for intra-condition dedup
+            self.state_label_map.insert(sym, id);
+            id
+        } else if let Some(&id) = self.state_label_map.get(&sym) {
+            self.parent.spec_block_state_labels.insert(sym, id);
+            id
         } else {
-            self.error(
-                loc,
-                &format!(
-                    "unknown function `{}` in behavior predicate",
-                    global_sym.display(self.env())
-                ),
-            );
-            None
+            let id = MemoryLabel::new(self.env().new_global_id().as_usize());
+            self.state_label_map.insert(sym, id);
+            self.parent.spec_block_state_labels.insert(sym, id);
+            self.env().set_memory_label_name(id, sym);
+            id
         }
+    }
+
+    /// Propagates state labels from a `StateLabeled` wrapper down to leaf operations
+    /// that access memory: `Behavior`, `SpecFunction`, `Global`, `Exists`.
+    fn propagate_state_labels(&self, exp: Exp, range: &MemoryRange) -> Exp {
+        use ExpData::*;
+        use Operation::*;
+        struct LabelPropagator<'a> {
+            range: &'a MemoryRange,
+            inside_old: bool,
+        }
+        impl ExpRewriterFunctions for LabelPropagator<'_> {
+            fn rewrite_exp(&mut self, exp: Exp) -> Exp {
+                // Intercept Behavior nodes *before* descent so we don't propagate
+                // outer labels into nested behavioral predicate arguments (which
+                // belong to a different state context).
+                if let Call(id, Behavior(kind, existing_range), args) = exp.as_ref() {
+                    // If the Behavior already has any explicit label, a prior
+                    // (inner) StateLabeled propagation set it — treat as a
+                    // barrier and don't merge with the outer range.  Only
+                    // label-free Behaviors inherit the enclosing range.
+                    let merged = if existing_range.pre.is_some() || existing_range.post.is_some() {
+                        existing_range.clone()
+                    } else {
+                        MemoryRange {
+                            pre: self.range.pre,
+                            post: self.range.post,
+                        }
+                    };
+                    let rewritten_args: Vec<Exp> =
+                        args.iter().map(|a| self.rewrite_exp(a.clone())).collect();
+                    Call(*id, Behavior(*kind, merged), rewritten_args).into_exp()
+                } else if let Call(
+                    id,
+                    op @ (SpecPublish(existing_range)
+                    | SpecRemove(existing_range)
+                    | SpecUpdate(existing_range)),
+                    args,
+                ) = exp.as_ref()
+                {
+                    // Mutation builtins are two-state, handled like Behavior:
+                    // barrier if already labeled, inherit if label-free.
+                    let merged = if existing_range.pre.is_some() || existing_range.post.is_some() {
+                        existing_range.clone()
+                    } else {
+                        MemoryRange {
+                            pre: self.range.pre,
+                            post: self.range.post,
+                        }
+                    };
+                    let new_op = match op {
+                        SpecPublish(_) => SpecPublish(merged),
+                        SpecRemove(_) => SpecRemove(merged),
+                        SpecUpdate(_) => SpecUpdate(merged),
+                        _ => unreachable!(),
+                    };
+                    let rewritten_args: Vec<Exp> =
+                        args.iter().map(|a| self.rewrite_exp(a.clone())).collect();
+                    Call(*id, new_op, rewritten_args).into_exp()
+                } else if let Call(id, Old, args) = exp.as_ref() {
+                    // Handle Old before descent so inside_old is set when children are visited.
+                    // If this were in rewrite_call, children would be rewritten first and
+                    // Global(None) would get the post label instead of the pre label.
+                    let prev = self.inside_old;
+                    self.inside_old = true;
+                    let new_arg = self.rewrite_exp(args[0].clone());
+                    self.inside_old = prev;
+                    Call(*id, Old, vec![new_arg]).into_exp()
+                } else {
+                    self.rewrite_exp_descent(exp)
+                }
+            }
+
+            fn rewrite_call(&mut self, id: NodeId, oper: &Operation, args: &[Exp]) -> Option<Exp> {
+                match oper {
+                    SpecFunction(mid, fid, existing_range) => {
+                        // Barrier: same logic as Behavior above.
+                        let merged =
+                            if existing_range.pre.is_some() || existing_range.post.is_some() {
+                                existing_range.clone()
+                            } else {
+                                MemoryRange {
+                                    pre: self.range.pre,
+                                    post: self.range.post,
+                                }
+                            };
+                        if merged != *existing_range {
+                            Some(
+                                Call(id, SpecFunction(*mid, *fid, merged), args.to_vec())
+                                    .into_exp(),
+                            )
+                        } else {
+                            None
+                        }
+                    },
+                    Global(None) => {
+                        let label = if self.inside_old {
+                            self.range.pre
+                        } else {
+                            // Use post label if available, otherwise fall back to pre label.
+                            // This handles intermediate state labels (e.g., `@at_op_12`)
+                            // where only a pre label is set but it should apply to all
+                            // memory references, not just those inside old().
+                            self.range.post.or(self.range.pre)
+                        };
+                        label.map(|l| Call(id, Global(Some(l)), args.to_vec()).into_exp())
+                    },
+                    Exists(None) => {
+                        let label = if self.inside_old {
+                            self.range.pre
+                        } else {
+                            self.range.post.or(self.range.pre)
+                        };
+                        label.map(|l| Call(id, Exists(Some(l)), args.to_vec()).into_exp())
+                    },
+                    _ => None,
+                }
+            }
+        }
+        let mut propagator = LabelPropagator {
+            range,
+            inside_old: false,
+        };
+        let result = propagator.rewrite_exp(exp);
+        // Check that two-state operations are not used with single-state `S |~`
+        // (where pre == post). Two-state operations include mutation builtins,
+        // ensures_of/result_of behavior predicates, and two-state spec functions.
+        let env = self.env();
+        result.visit_pre_order(&mut |e| {
+            let (id, range, desc) = match e {
+                ExpData::Call(id, SpecPublish(r) | SpecRemove(r) | SpecUpdate(r), _) => {
+                    (*id, r, "mutation builtins (publish/remove/update)")
+                },
+                ExpData::Call(
+                    id,
+                    Behavior(BehaviorKind::EnsuresOf | BehaviorKind::ResultOf, r),
+                    _,
+                ) => (*id, r, "ensures_of/result_of"),
+                ExpData::Call(id, SpecFunction(mid, fid, r), _) => {
+                    let is_two_state = env.get_module_opt(*mid).is_some_and(|m| {
+                        m.get_spec_funs()
+                            .any(|(sid, decl)| *sid == *fid && decl.uses_old)
+                    });
+                    if is_two_state {
+                        (*id, r, "two-state spec functions")
+                    } else {
+                        return true;
+                    }
+                },
+                _ => return true,
+            };
+            if range.pre.is_some() && range.post.is_some() && range.pre == range.post {
+                self.error(
+                    &env.get_node_loc(id),
+                    &format!(
+                        "{} require two-state range notation; \
+                         use `..S |~` (post-only), `S.. |~` (pre-only), \
+                         or `A..S |~` (full range) instead of `S |~`",
+                        desc
+                    ),
+                );
+            }
+            true
+        });
+        result
     }
 
     /// Computes the expected argument types for a behavior predicate based on kind.
@@ -6007,11 +6288,6 @@ impl ExpTranslator<'_, '_, '_> {
                     }
                 }
                 types
-            },
-            BehaviorKind::ModifiesOf => {
-                // modifies_of takes global resource references, not function parameters.
-                // We don't enforce argument count or types here.
-                vec![]
             },
         }
     }
@@ -6071,15 +6347,7 @@ impl ExpTranslator<'_, '_, '_> {
         expected_types: &[Type],
         kind: &BehaviorKind,
     ) -> Vec<Exp> {
-        // For modifies_of, arguments must be global resource expressions
-        if matches!(kind, BehaviorKind::ModifiesOf) {
-            return args
-                .iter()
-                .map(|arg| self.translate_modify_target(arg).into_exp())
-                .collect();
-        }
-
-        // Check arity for other behavior kinds
+        // Check arity for behavior kinds
         if args.len() != expected_types.len() {
             self.error(
                 loc,
