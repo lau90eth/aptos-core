@@ -9,19 +9,20 @@ use crate::{
     error::ExecutionResult,
     heap::{
         macros::{alloc_obj, alloc_vec, gc_collect, grow_vec_ref},
+        object_descriptor::{ObjectDescriptor, CLOSURE_DESCRIPTOR_ID},
         pinned_roots::PinnedRoots,
         Heap,
     },
     memory::{read_ptr, read_u32, read_u64, vec_elem_ptr, write_ptr, write_u64, MemoryRegion},
     types::{
-        ObjectDescriptor, StepResult, DEFAULT_HEAP_SIZE, DEFAULT_STACK_SIZE, HEADER_SIZE_OFFSET,
+        StepResult, DEFAULT_HEAP_SIZE, DEFAULT_STACK_SIZE, HEADER_SIZE_OFFSET,
         META_SAVED_FP_OFFSET, META_SAVED_FUNC_PTR_OFFSET, META_SAVED_PC_OFFSET, VEC_DATA_OFFSET,
         VEC_LENGTH_OFFSET,
     },
 };
 use mono_move_core::{
-    CallClosureOp, ClosureFuncRef, DescriptorId, Function, MicroOp, PackClosureOp, SizedSlot,
-    TransactionContext, CAPTURED_DATA_TAG_MATERIALIZED, CAPTURED_DATA_TAG_OFFSET,
+    CallClosureOp, ClosureFuncRef, DescriptorId, ExecutionContext, FrameOffset, Function, MicroOp,
+    PackClosureOp, SizedSlot, CAPTURED_DATA_TAG_MATERIALIZED, CAPTURED_DATA_TAG_OFFSET,
     CAPTURED_DATA_VALUES_OFFSET, CLOSURE_CAPTURED_DATA_PTR_OFFSET, CLOSURE_FUNC_REF_OFFSET,
     CLOSURE_MASK_OFFSET, FRAME_METADATA_SIZE, FUNC_REF_PAYLOAD_OFFSET, FUNC_REF_TAG_OFFSET,
     FUNC_REF_TAG_RESOLVED,
@@ -35,13 +36,11 @@ use std::ptr::{null, NonNull};
 // ---------------------------------------------------------------------------
 
 /// Interpreter context with a unified call stack and a GC-managed heap.
-pub struct InterpreterContext<'a, G: GasMeter> {
+pub struct InterpreterContext<'a, T: ExecutionContext> {
     /// Per-transaction context (function resolution, gas counters, etc.).
-    pub(crate) txn_ctx: &'a dyn TransactionContext,
+    pub(crate) exec_ctx: &'a mut T,
     /// Externally-provided object layout descriptors (will be replaced by execution context).
     pub(crate) descriptors: &'a [ObjectDescriptor],
-    /// Externally-provided gas meter (will be replaced by execution context).
-    pub(crate) gas_meter: G,
 
     pub(crate) pc: usize,
     /// Pointer to the currently executing function.
@@ -59,21 +58,15 @@ pub struct InterpreterContext<'a, G: GasMeter> {
     rng: StdRng,
 }
 
-impl<'a, G: GasMeter> InterpreterContext<'a, G> {
-    pub fn new(
-        txn_ctx: &'a dyn TransactionContext,
-        descriptors: &'a [ObjectDescriptor],
-        gas_meter: G,
-        entry: &Function,
-    ) -> Self {
-        Self::with_heap_size(txn_ctx, descriptors, gas_meter, entry, DEFAULT_HEAP_SIZE)
+impl<'a, T: ExecutionContext> InterpreterContext<'a, T> {
+    pub fn new(exec_ctx: &'a mut T, descriptors: &'a [ObjectDescriptor], entry: &Function) -> Self {
+        Self::with_heap_size(exec_ctx, descriptors, entry, DEFAULT_HEAP_SIZE)
     }
 
     /// Create a new context with a custom heap size (for testing GC pressure).
     pub fn with_heap_size(
-        txn_ctx: &'a dyn TransactionContext,
+        exec_ctx: &'a mut T,
         descriptors: &'a [ObjectDescriptor],
-        gas_meter: G,
         entry: &Function,
         heap_size: usize,
     ) -> Self {
@@ -99,9 +92,8 @@ impl<'a, G: GasMeter> InterpreterContext<'a, G> {
         }
 
         Self {
-            txn_ctx,
+            exec_ctx,
             descriptors,
-            gas_meter,
             pc: 0,
             current_func: NonNull::from(entry),
             frame_ptr,
@@ -202,10 +194,135 @@ impl<'a, G: GasMeter> InterpreterContext<'a, G> {
 }
 
 // ---------------------------------------------------------------------------
+// Arithmetic helpers
+// ---------------------------------------------------------------------------
+//
+// All arithmetic micro-ops follow one of a few shapes — read 1 or 2 u64
+// frame slots, apply a (possibly fallible) computation, write the result
+// to a destination slot. The helpers below capture each shape so the
+// `step()` arms stay one line each and the read/write boilerplate lives
+// in one place.
+//
+// `#[inline(always)]` ensures the closures and the helper itself are
+// folded into the caller in release builds. Inlining verified by
+// inspecting the release-build x64 asm for `step::<SimpleGasMeter>` on
+// 2026-04-30: zero standalone definitions for any helper or closure,
+// zero call/jmp instructions targeting them, and individual arms
+// compile to a handful of direct memory ops (e.g. AddU64 is 4 movs +
+// addq + jae + jmp).
+//
+// TODO: re-verify inlining after non-trivial changes to the helpers,
+// the call sites, or the rustc/LLVM versions the workspace pins to.
+
+/// `dst <- op(lhs_slot, rhs_slot)` (infallible).
+#[inline(always)]
+unsafe fn binop_u64<F: FnOnce(u64, u64) -> u64>(
+    fp: *mut u8,
+    dst: FrameOffset,
+    lhs: FrameOffset,
+    rhs: FrameOffset,
+    op: F,
+) {
+    // SAFETY: `fp` is the current frame pointer and `lhs`/`rhs`/`dst` are
+    // in-bounds 8-byte slots within that frame (enforced by the verifier).
+    unsafe {
+        let a = read_u64(fp, lhs);
+        let b = read_u64(fp, rhs);
+        write_u64(fp, dst, op(a, b));
+    }
+}
+
+/// `dst <- op(lhs_slot, rhs_slot)`. Bail with `err` on `None`.
+#[inline(always)]
+unsafe fn checked_binop_u64<F: FnOnce(u64, u64) -> Option<u64>>(
+    fp: *mut u8,
+    dst: FrameOffset,
+    lhs: FrameOffset,
+    rhs: FrameOffset,
+    op: F,
+    err: &'static str,
+) -> ExecutionResult<()> {
+    // SAFETY: `fp` is the current frame pointer and `lhs`/`rhs`/`dst` are
+    // in-bounds 8-byte slots within that frame (enforced by the verifier).
+    unsafe {
+        let a = read_u64(fp, lhs);
+        let b = read_u64(fp, rhs);
+        match op(a, b) {
+            Some(v) => write_u64(fp, dst, v),
+            None => bail!(err),
+        }
+        Ok(())
+    }
+}
+
+/// `dst <- op(src_slot, imm)` (infallible).
+#[inline(always)]
+unsafe fn imm_op_u64<F: FnOnce(u64, u64) -> u64>(
+    fp: *mut u8,
+    dst: FrameOffset,
+    src: FrameOffset,
+    imm: u64,
+    op: F,
+) {
+    // SAFETY: `fp` is the current frame pointer and `src`/`dst` are
+    // in-bounds 8-byte slots within that frame (enforced by the verifier).
+    unsafe {
+        let a = read_u64(fp, src);
+        write_u64(fp, dst, op(a, imm));
+    }
+}
+
+/// `dst <- op(src_slot, imm)`. Bail with `err` on `None`.
+#[inline(always)]
+unsafe fn checked_imm_op_u64<F: FnOnce(u64, u64) -> Option<u64>>(
+    fp: *mut u8,
+    dst: FrameOffset,
+    src: FrameOffset,
+    imm: u64,
+    op: F,
+    err: &'static str,
+) -> ExecutionResult<()> {
+    // SAFETY: `fp` is the current frame pointer and `src`/`dst` are
+    // in-bounds 8-byte slots within that frame (enforced by the verifier).
+    unsafe {
+        let a = read_u64(fp, src);
+        match op(a, imm) {
+            Some(v) => write_u64(fp, dst, v),
+            None => bail!(err),
+        }
+        Ok(())
+    }
+}
+
+/// `dst <- op(lhs_slot, rhs_slot_as_shift)`. Bail if shift `>= 64`.
+/// `op_name` is used to format the error message.
+#[inline(always)]
+unsafe fn shift_u64<F: FnOnce(u64, u64) -> u64>(
+    fp: *mut u8,
+    dst: FrameOffset,
+    lhs: FrameOffset,
+    rhs: FrameOffset,
+    op: F,
+    op_name: &'static str,
+) -> ExecutionResult<()> {
+    // SAFETY: `fp` is the current frame pointer and `lhs`/`rhs`/`dst` are
+    // in-bounds 8-byte slots within that frame (enforced by the verifier).
+    unsafe {
+        let shift = read_u64(fp, rhs);
+        if shift >= 64 {
+            bail!("{}: shift amount {} exceeds 63", op_name, shift);
+        }
+        let v = read_u64(fp, lhs);
+        write_u64(fp, dst, op(v, shift));
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Interpreter loop
 // ---------------------------------------------------------------------------
 
-impl<G: GasMeter> InterpreterContext<'_, G> {
+impl<T: ExecutionContext> InterpreterContext<'_, T> {
     #[inline(always)]
     pub fn step(&mut self) -> ExecutionResult<StepResult> {
         // SAFETY: Current function is always a valid, non-null pointer because
@@ -240,13 +357,13 @@ impl<G: GasMeter> InterpreterContext<'_, G> {
                     executable_id,
                     func_name,
                 } => {
-                    // Cross-module slow path, may trigger lazy module loading here.
-                    let Some(target) = self.txn_ctx.resolve_function(executable_id, func_name)
-                    else {
-                        // TODO: Once loader is in place, this should load the module
-                        // and retry resolution instead of bailing immediately.
-                        bail!("CallIndirect: function not found");
-                    };
+                    // Cross-module slow path: dispatches through the
+                    // transaction context, which triggers lazy module
+                    // loading on a cache miss.
+                    let target = self.exec_ctx.load_function(executable_id, func_name)?;
+                    // SAFETY: `target` points to a `Function` allocated in a
+                    // `LoadedModule`'s arena, which is held alive by the
+                    // global executable cache for the lifetime of `exec_ctx`.
                     return self.call(func, fp, target.as_ref_unchecked());
                 },
                 MicroOp::CallDirect { ptr } => {
@@ -348,68 +465,104 @@ impl<G: GasMeter> InterpreterContext<'_, G> {
                 },
 
                 // ----- Arithmetic -----
-                MicroOp::StoreImm8 { dst, imm } => {
-                    write_u64(fp, dst, imm);
-                },
+                MicroOp::StoreImm8 { dst, imm } => write_u64(fp, dst, imm),
 
-                MicroOp::SubU64Imm { dst, src, imm } => {
-                    let v = read_u64(fp, src);
-                    let result = match v.checked_sub(imm) {
-                        Some(v) => v,
-                        None => bail!("arithmetic underflow"),
-                    };
-                    write_u64(fp, dst, result);
-                },
-
+                // Add
                 MicroOp::AddU64 { dst, lhs, rhs } => {
-                    let v1 = read_u64(fp, lhs);
-                    let v2 = read_u64(fp, rhs);
-                    let result = match v1.checked_add(v2) {
-                        Some(v) => v,
-                        None => bail!("arithmetic overflow"),
-                    };
-                    write_u64(fp, dst, result);
+                    checked_binop_u64(fp, dst, lhs, rhs, u64::checked_add, "AddU64: overflow")?
                 },
-
                 MicroOp::AddU64Imm { dst, src, imm } => {
-                    let v = read_u64(fp, src);
-                    let result = match v.checked_add(imm) {
-                        Some(v) => v,
-                        None => bail!("arithmetic overflow"),
-                    };
-                    write_u64(fp, dst, result);
+                    checked_imm_op_u64(fp, dst, src, imm, u64::checked_add, "AddU64Imm: overflow")?
                 },
 
-                MicroOp::RSubU64Imm { dst, src, imm } => {
-                    let v = read_u64(fp, src);
-                    let result = match imm.checked_sub(v) {
-                        Some(v) => v,
-                        None => bail!("arithmetic underflow"),
-                    };
-                    write_u64(fp, dst, result);
+                // Sub
+                MicroOp::SubU64 { dst, lhs, rhs } => {
+                    checked_binop_u64(fp, dst, lhs, rhs, u64::checked_sub, "SubU64: underflow")?
+                },
+                MicroOp::SubU64Imm { dst, src, imm } => {
+                    checked_imm_op_u64(fp, dst, src, imm, u64::checked_sub, "SubU64Imm: underflow")?
+                },
+                // dst = imm - src, so flip the operand order.
+                MicroOp::RSubU64Imm { dst, src, imm } => checked_imm_op_u64(
+                    fp,
+                    dst,
+                    src,
+                    imm,
+                    |s, i| u64::checked_sub(i, s),
+                    "RSubU64Imm: underflow",
+                )?,
+
+                // Mul
+                MicroOp::MulU64 { dst, lhs, rhs } => {
+                    checked_binop_u64(fp, dst, lhs, rhs, u64::checked_mul, "MulU64: overflow")?
+                },
+                MicroOp::MulU64Imm { dst, src, imm } => {
+                    checked_imm_op_u64(fp, dst, src, imm, u64::checked_mul, "MulU64Imm: overflow")?
                 },
 
-                MicroOp::XorU64 { dst, lhs, rhs } => {
-                    let lhs_val = read_u64(fp, lhs);
-                    let rhs_val = read_u64(fp, rhs);
-                    write_u64(fp, dst, lhs_val ^ rhs_val);
+                // Div / Mod
+                MicroOp::DivU64 { dst, lhs, rhs } => checked_binop_u64(
+                    fp,
+                    dst,
+                    lhs,
+                    rhs,
+                    u64::checked_div,
+                    "DivU64: division by zero",
+                )?,
+                // INVARIANT: the verifier rejects `imm == 0`, so plain `s / imm`
+                // cannot trigger Rust's div-by-zero panic. Asserted below in
+                // debug builds as a defensive check.
+                MicroOp::DivU64Imm { dst, src, imm } => {
+                    debug_assert!(
+                        imm != 0,
+                        "DivU64Imm: imm must be non-zero (verifier invariant)"
+                    );
+                    imm_op_u64(fp, dst, src, imm, |s, i| s / i)
+                },
+                MicroOp::ModU64 { dst, lhs, rhs } => checked_binop_u64(
+                    fp,
+                    dst,
+                    lhs,
+                    rhs,
+                    u64::checked_rem,
+                    "ModU64: division by zero",
+                )?,
+                // INVARIANT: the verifier rejects `imm == 0`, so plain `s % imm`
+                // cannot trigger Rust's div-by-zero panic. Asserted below in
+                // debug builds as a defensive check.
+                MicroOp::ModU64Imm { dst, src, imm } => {
+                    debug_assert!(
+                        imm != 0,
+                        "ModU64Imm: imm must be non-zero (verifier invariant)"
+                    );
+                    imm_op_u64(fp, dst, src, imm, |s, i| s % i)
                 },
 
+                // Bitwise (infallible)
+                MicroOp::BitAndU64 { dst, lhs, rhs } => binop_u64(fp, dst, lhs, rhs, |a, b| a & b),
+                MicroOp::BitOrU64 { dst, lhs, rhs } => binop_u64(fp, dst, lhs, rhs, |a, b| a | b),
+                MicroOp::BitXorU64 { dst, lhs, rhs } => binop_u64(fp, dst, lhs, rhs, |a, b| a ^ b),
+
+                // Shifts
+                MicroOp::ShlU64 { dst, lhs, rhs } => {
+                    shift_u64(fp, dst, lhs, rhs, |v, s| v << s, "ShlU64")?
+                },
+                // INVARIANT: the verifier rejects `imm >= 64`, so plain `s << imm`
+                // cannot wrap or trigger UB. Asserted below in debug builds as a
+                // defensive check.
+                MicroOp::ShlU64Imm { dst, src, imm } => {
+                    debug_assert!(imm < 64, "ShlU64Imm: imm must be < 64 (verifier invariant)");
+                    imm_op_u64(fp, dst, src, imm, |s, i| s << i)
+                },
+                MicroOp::ShrU64 { dst, lhs, rhs } => {
+                    shift_u64(fp, dst, lhs, rhs, |v, s| v >> s, "ShrU64")?
+                },
+                // INVARIANT: the verifier rejects `imm >= 64`, so plain `s >> imm`
+                // cannot wrap or trigger UB. Asserted below in debug builds as a
+                // defensive check.
                 MicroOp::ShrU64Imm { dst, src, imm } => {
-                    if imm > 63 {
-                        bail!("ShrU64Imm: shift amount {} exceeds 63", imm);
-                    }
-                    let v = read_u64(fp, src);
-                    write_u64(fp, dst, v >> imm);
-                },
-
-                MicroOp::ModU64 { dst, lhs, rhs } => {
-                    let lhs_val = read_u64(fp, lhs);
-                    let rhs_val = read_u64(fp, rhs);
-                    if rhs_val == 0 {
-                        bail!("ModU64: division by zero");
-                    }
-                    write_u64(fp, dst, lhs_val % rhs_val);
+                    debug_assert!(imm < 64, "ShrU64Imm: imm must be < 64 (verifier invariant)");
+                    imm_op_u64(fp, dst, src, imm, |s, i| s >> i)
                 },
 
                 MicroOp::StoreRandomU64 { dst } => {
@@ -682,7 +835,7 @@ impl<G: GasMeter> InterpreterContext<'_, G> {
                 },
 
                 MicroOp::Charge { cost } => {
-                    self.gas_meter.charge(cost)?;
+                    self.exec_ctx.gas_meter().charge(cost)?;
                 },
 
                 MicroOp::PackClosure(ref op) => {
@@ -736,7 +889,7 @@ impl<G: GasMeter> InterpreterContext<'_, G> {
             // and leave `captured_data_ptr` as the zeroed/null value written
             // by `alloc_obj`. No pinning needed — only one allocation.
             if op.captured.is_empty() {
-                let closure = alloc_obj!(self, fp, op.closure_descriptor_id)?;
+                let closure = alloc_obj!(self, fp, CLOSURE_DESCRIPTOR_ID)?;
                 self.write_closure_func_ref_and_mask(closure, op);
                 write_ptr(fp, op.dst, closure);
                 return Ok(());
@@ -750,12 +903,17 @@ impl<G: GasMeter> InterpreterContext<'_, G> {
             // skipped). Pinning keeps the closure live across the second
             // allocation and lets GC update the pinned slot in-place if
             // the object is relocated.
-            let closure_ptr = alloc_obj!(self, fp, op.closure_descriptor_id)?;
+            let closure_ptr = alloc_obj!(self, fp, CLOSURE_DESCRIPTOR_ID)?;
             let pin = self.pinned_roots.pin(NonNull::new_unchecked(closure_ptr));
 
             self.write_closure_func_ref_and_mask(pin.get().as_ptr(), op);
 
-            let captured_data = alloc_obj!(self, fp, op.captured_data_descriptor_id)?;
+            // SAFETY: the verifier guarantees `captured_data_descriptor_id`
+            // is `Some(CapturedData)` whenever `captured` is non-empty.
+            let captured_desc_id = op
+                .captured_data_descriptor_id
+                .expect("verifier ensures Some when captured is non-empty");
+            let captured_data = alloc_obj!(self, fp, captured_desc_id)?;
             *captured_data.add(CAPTURED_DATA_TAG_OFFSET) = CAPTURED_DATA_TAG_MATERIALIZED;
 
             let mut captured_offset = CAPTURED_DATA_VALUES_OFFSET;

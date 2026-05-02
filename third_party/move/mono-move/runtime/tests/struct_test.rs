@@ -5,12 +5,12 @@
 
 use mono_move_alloc::{ExecutableArena, ExecutableArenaPtr, GlobalArenaPtr};
 use mono_move_core::{
-    DescriptorId, FrameLayoutInfo, FrameOffset as FO, Function, MicroOp, NoopTransactionContext,
+    FrameLayoutInfo, FrameOffset as FO, Function, LocalExecutionContext, MicroOp,
     SortedSafePointEntries, STRUCT_DATA_OFFSET,
 };
-use mono_move_gas::SimpleGasMeter;
 use mono_move_runtime::{
-    read_ptr, read_u64, InterpreterContext, ObjectDescriptor, VEC_DATA_OFFSET, VEC_LENGTH_OFFSET,
+    read_ptr, read_u64, InterpreterContext, ObjectDescriptor, ObjectDescriptorTable,
+    VEC_DATA_OFFSET, VEC_LENGTH_OFFSET,
 };
 
 // ---------------------------------------------------------------------------
@@ -45,10 +45,10 @@ fn struct_inline() {
         frame_layout: FrameLayoutInfo::empty(),
         safe_point_layouts: SortedSafePointEntries::empty(),
     })];
-    let descriptors = [ObjectDescriptor::Trivial];
-    let txn_ctx = NoopTransactionContext;
-    let gas_meter = SimpleGasMeter::new(u64::MAX);
-    let mut ctx = InterpreterContext::new(&txn_ctx, &descriptors, gas_meter, unsafe {
+    let descriptors = ObjectDescriptorTable::new();
+
+    let mut exec_ctx = LocalExecutionContext::with_max_budget();
+    let mut ctx = InterpreterContext::new(&mut exec_ctx, &descriptors, unsafe {
         functions[0].as_ref_unchecked()
     });
     ctx.run().unwrap();
@@ -93,10 +93,10 @@ fn struct_inline_borrow() {
         frame_layout: FrameLayoutInfo::new(&arena, [FO(r#ref)]),
         safe_point_layouts: SortedSafePointEntries::empty(),
     })];
-    let descriptors = [ObjectDescriptor::Trivial];
-    let txn_ctx = NoopTransactionContext;
-    let gas_meter = SimpleGasMeter::new(u64::MAX);
-    let mut ctx = InterpreterContext::new(&txn_ctx, &descriptors, gas_meter, unsafe {
+    let descriptors = ObjectDescriptorTable::new();
+
+    let mut exec_ctx = LocalExecutionContext::with_max_budget();
+    let mut ctx = InterpreterContext::new(&mut exec_ctx, &descriptors, unsafe {
         functions[0].as_ref_unchecked()
     });
     ctx.run().unwrap();
@@ -118,9 +118,12 @@ fn struct_heap_basic() {
 
     let arena = ExecutableArena::new();
 
+    let mut descriptors = ObjectDescriptorTable::new();
+    let desc_entry_struct = descriptors.push(ObjectDescriptor::new_struct(16, vec![]).unwrap());
+
     #[rustfmt::skip]
     let code = arena.alloc_slice_fill_iter([
-        HeapNew { dst: FO(entry), descriptor_id: DescriptorId(0) },
+        HeapNew { dst: FO(entry), descriptor_id: desc_entry_struct },
         StoreImm8 { dst: FO(tmp), imm: 42 },
         MicroOp::struct_store8(FO(entry), 0, FO(tmp)),
         StoreImm8 { dst: FO(tmp), imm: 100 },
@@ -141,13 +144,9 @@ fn struct_heap_basic() {
         frame_layout: FrameLayoutInfo::new(&arena, [FO(entry)]),
         safe_point_layouts: SortedSafePointEntries::empty(),
     })];
-    let descriptors = [ObjectDescriptor::Struct {
-        size: 16,
-        pointer_offsets: vec![],
-    }];
-    let txn_ctx = NoopTransactionContext;
-    let gas_meter = SimpleGasMeter::new(u64::MAX);
-    let mut ctx = InterpreterContext::new(&txn_ctx, &descriptors, gas_meter, unsafe {
+
+    let mut exec_ctx = LocalExecutionContext::with_max_budget();
+    let mut ctx = InterpreterContext::new(&mut exec_ctx, &descriptors, unsafe {
         functions[0].as_ref_unchecked()
     });
     ctx.run().unwrap();
@@ -169,9 +168,12 @@ fn struct_heap_survives_gc() {
 
     let arena = ExecutableArena::new();
 
+    let mut descriptors = ObjectDescriptorTable::new();
+    let desc_entry_struct = descriptors.push(ObjectDescriptor::new_struct(16, vec![]).unwrap());
+
     #[rustfmt::skip]
     let code = arena.alloc_slice_fill_iter([
-        HeapNew { dst: FO(entry), descriptor_id: DescriptorId(0) },
+        HeapNew { dst: FO(entry), descriptor_id: desc_entry_struct },
         StoreImm8 { dst: FO(tmp), imm: 7 },
         MicroOp::struct_store8(FO(entry), 0, FO(tmp)),
         StoreImm8 { dst: FO(tmp), imm: 13 },
@@ -193,13 +195,9 @@ fn struct_heap_survives_gc() {
         frame_layout: FrameLayoutInfo::new(&arena, [FO(entry)]),
         safe_point_layouts: SortedSafePointEntries::empty(),
     })];
-    let descriptors = [ObjectDescriptor::Struct {
-        size: 16,
-        pointer_offsets: vec![],
-    }];
-    let txn_ctx = NoopTransactionContext;
-    let gas_meter = SimpleGasMeter::new(u64::MAX);
-    let mut ctx = InterpreterContext::new(&txn_ctx, &descriptors, gas_meter, unsafe {
+
+    let mut exec_ctx = LocalExecutionContext::with_max_budget();
+    let mut ctx = InterpreterContext::new(&mut exec_ctx, &descriptors, unsafe {
         functions[0].as_ref_unchecked()
     });
     ctx.run().unwrap();
@@ -229,19 +227,23 @@ fn struct_with_vector_field() {
 
     let arena = ExecutableArena::new();
 
+    let mut descriptors = ObjectDescriptorTable::new();
+    let desc_ctr_struct = descriptors.push(ObjectDescriptor::new_struct(16, vec![8]).unwrap());
+    let desc_vec_u64 = descriptors.push(ObjectDescriptor::new_vector(8, vec![]).unwrap());
+
     #[rustfmt::skip]
     let code = arena.alloc_slice_fill_iter([
-        HeapNew { dst: FO(ctr), descriptor_id: DescriptorId(0) },
+        HeapNew { dst: FO(ctr), descriptor_id: desc_ctr_struct },
         StoreImm8 { dst: FO(tmp), imm: 999 },
         MicroOp::struct_store8(FO(ctr), 0, FO(tmp)),
         VecNew { dst: FO(items) },
         SlotBorrow { dst: FO(vec_ref), local: FO(items) },
         StoreImm8 { dst: FO(tmp), imm: 10 },
-        VecPushBack { vec_ref: FO(vec_ref), elem: FO(tmp), elem_size: 8, descriptor_id: DescriptorId(1) },
+        VecPushBack { vec_ref: FO(vec_ref), elem: FO(tmp), elem_size: 8, descriptor_id: desc_vec_u64 },
         StoreImm8 { dst: FO(tmp), imm: 20 },
-        VecPushBack { vec_ref: FO(vec_ref), elem: FO(tmp), elem_size: 8, descriptor_id: DescriptorId(1) },
+        VecPushBack { vec_ref: FO(vec_ref), elem: FO(tmp), elem_size: 8, descriptor_id: desc_vec_u64 },
         StoreImm8 { dst: FO(tmp), imm: 30 },
-        VecPushBack { vec_ref: FO(vec_ref), elem: FO(tmp), elem_size: 8, descriptor_id: DescriptorId(1) },
+        VecPushBack { vec_ref: FO(vec_ref), elem: FO(tmp), elem_size: 8, descriptor_id: desc_vec_u64 },
         MicroOp::struct_store8(FO(ctr), 8, FO(items)),
         ForceGC,
         SlotBorrow { dst: FO(ctr_ref), local: FO(ctr) },
@@ -261,16 +263,9 @@ fn struct_with_vector_field() {
         frame_layout: FrameLayoutInfo::new(&arena, [FO(ctr), FO(items), FO(vec_ref), FO(ctr_ref)]),
         safe_point_layouts: SortedSafePointEntries::empty(),
     })];
-    let descriptors = [
-        ObjectDescriptor::Struct {
-            size: 16,
-            pointer_offsets: vec![8],
-        },
-        ObjectDescriptor::Trivial,
-    ];
-    let txn_ctx = NoopTransactionContext;
-    let gas_meter = SimpleGasMeter::new(u64::MAX);
-    let mut ctx = InterpreterContext::new(&txn_ctx, &descriptors, gas_meter, unsafe {
+
+    let mut exec_ctx = LocalExecutionContext::with_max_budget();
+    let mut ctx = InterpreterContext::new(&mut exec_ctx, &descriptors, unsafe {
         functions[0].as_ref_unchecked()
     });
     ctx.run().unwrap();
@@ -305,9 +300,12 @@ fn struct_borrow_field() {
 
     let arena = ExecutableArena::new();
 
+    let mut descriptors = ObjectDescriptorTable::new();
+    let desc_entry_struct = descriptors.push(ObjectDescriptor::new_struct(16, vec![]).unwrap());
+
     #[rustfmt::skip]
     let code = arena.alloc_slice_fill_iter([
-        HeapNew { dst: FO(entry), descriptor_id: DescriptorId(0) },
+        HeapNew { dst: FO(entry), descriptor_id: desc_entry_struct },
         StoreImm8 { dst: FO(result), imm: 5 },
         MicroOp::struct_store8(FO(entry), 0, FO(result)),
         StoreImm8 { dst: FO(result), imm: 10 },
@@ -331,13 +329,9 @@ fn struct_borrow_field() {
         frame_layout: FrameLayoutInfo::new(&arena, [FO(entry), FO(r#ref), FO(entry_ref)]),
         safe_point_layouts: SortedSafePointEntries::empty(),
     })];
-    let descriptors = [ObjectDescriptor::Struct {
-        size: 16,
-        pointer_offsets: vec![],
-    }];
-    let txn_ctx = NoopTransactionContext;
-    let gas_meter = SimpleGasMeter::new(u64::MAX);
-    let mut ctx = InterpreterContext::new(&txn_ctx, &descriptors, gas_meter, unsafe {
+
+    let mut exec_ctx = LocalExecutionContext::with_max_budget();
+    let mut ctx = InterpreterContext::new(&mut exec_ctx, &descriptors, unsafe {
         functions[0].as_ref_unchecked()
     });
     ctx.run().unwrap();
@@ -365,9 +359,12 @@ fn struct_borrow_survives_gc() {
 
     let arena = ExecutableArena::new();
 
+    let mut descriptors = ObjectDescriptorTable::new();
+    let desc_entry_struct = descriptors.push(ObjectDescriptor::new_struct(16, vec![]).unwrap());
+
     #[rustfmt::skip]
     let code = arena.alloc_slice_fill_iter([
-        HeapNew { dst: FO(entry), descriptor_id: DescriptorId(0) },
+        HeapNew { dst: FO(entry), descriptor_id: desc_entry_struct },
         StoreImm8 { dst: FO(result), imm: 100 },
         MicroOp::struct_store8(FO(entry), 0, FO(result)),
         StoreImm8 { dst: FO(result), imm: 200 },
@@ -389,13 +386,9 @@ fn struct_borrow_survives_gc() {
         frame_layout: FrameLayoutInfo::new(&arena, [FO(entry), FO(ref_base), FO(entry_ref)]),
         safe_point_layouts: SortedSafePointEntries::empty(),
     })];
-    let descriptors = [ObjectDescriptor::Struct {
-        size: 16,
-        pointer_offsets: vec![],
-    }];
-    let txn_ctx = NoopTransactionContext;
-    let gas_meter = SimpleGasMeter::new(u64::MAX);
-    let mut ctx = InterpreterContext::new(&txn_ctx, &descriptors, gas_meter, unsafe {
+
+    let mut exec_ctx = LocalExecutionContext::with_max_budget();
+    let mut ctx = InterpreterContext::new(&mut exec_ctx, &descriptors, unsafe {
         functions[0].as_ref_unchecked()
     });
     ctx.run().unwrap();
